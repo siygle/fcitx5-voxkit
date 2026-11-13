@@ -1,6 +1,6 @@
 # Builds fcitx5-voxkit (module + voxkit daemon) from this checkout.
 pkgname=fcitx5-voxkit
-pkgver=0.1.0.r.g
+pkgver=0.1.0.r1.g5ef9521
 pkgrel=1
 pkgdesc="Push-to-talk local dictation for any fcitx5 input method (voxkit daemon + module)"
 arch=(x86_64)
