@@ -1,0 +1,28 @@
+# User unit for the voxkit dictation daemon (installed by fcitx5-voxkit).
+# Enable: systemctl --user enable --now voxkit.service
+#
+# Models: by default this reuses the Qwen3-ASR + Silero files that the Hex
+# app already downloaded (checksums match), read-only. To use voxkit's own
+# store instead, override VOXKIT_MODELS_DIR in a drop-in:
+#   systemctl --user edit voxkit.service
+[Unit]
+Description=voxkit local dictation daemon (fcitx5-voxkit)
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=VOXKIT_MODELS_DIR=%h/.local/share/hex/models
+Environment=VOXKIT_MODEL=qwen3-asr-0.6b
+ExecStart=/usr/bin/voxkit serve
+Restart=on-failure
+RestartSec=2
+# Read the models, write nothing outside the runtime dir.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.16)
+project(fcitx5-voxkit VERSION 0.1.0 LANGUAGES CXX)
+
+find_package(ECM REQUIRED 1.0.0)
+set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH} ${CMAKE_MODULE_PATH})
+find_package(Fcitx5Core 5.1 REQUIRED)
+find_package(Fcitx5Module REQUIRED COMPONENTS TestFrontend)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+include(FeatureSummary)
+include("${FCITX_INSTALL_CMAKECONFIG_DIR}/Fcitx5Utils/Fcitx5CompilerSettings.cmake")
+set(CMAKE_CXX_STANDARD 20)
+
+option(ENABLE_TEST "Build tests" ON)
+
+add_subdirectory(module)
+if (ENABLE_TEST)
+    enable_testing()
+    add_subdirectory(test)
+endif()
+feature_summary(WHAT ALL FATAL_ON_MISSING_REQUIRED_PACKAGES)

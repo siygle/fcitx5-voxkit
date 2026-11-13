@@ -1,0 +1,32 @@
+# Builds fcitx5-voxkit (module + voxkit daemon) from this checkout.
+pkgname=fcitx5-voxkit
+pkgver=0.1.0.r.g
+pkgrel=1
+pkgdesc="Push-to-talk local dictation for any fcitx5 input method (voxkit daemon + module)"
+arch=(x86_64)
+url="https://github.com/siygle/fcitx5-voxkit"
+license=(MIT)
+depends=(fcitx5 json-c alsa-lib gcc-libs glibc)
+optdepends=('opencc: Traditional Chinese conversion (s2twp)'
+            'hex-bin: provides the Qwen3-ASR model files the service reuses')
+makedepends=(cmake extra-cmake-modules ninja git)
+options=(!debug !lto)
+_src=$(realpath "$startdir/..")
+pkgver() {
+  echo "0.1.0.r$(git -C "$_src" rev-list --count HEAD).g$(git -C "$_src" rev-parse --short HEAD)"
+}
+build() {
+  cmake -S "$_src" -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_BUILD_TYPE=Release -DENABLE_TEST=OFF
+  cmake --build build
+  # Cargo.lock is committed; no network beyond crates already in ~/.cargo.
+  cargo build --release --locked --manifest-path "$_src/daemon/Cargo.toml" \
+    --target-dir "$srcdir/cargo-target"
+}
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm755 "$srcdir/cargo-target/release/voxkit" "$pkgdir/usr/bin/voxkit"
+  install -Dm644 "$_src/daemon/systemd/voxkit.service" "$pkgdir/usr/lib/systemd/user/voxkit.service"
+  install -Dm644 "$_src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$_src/daemon/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+}
