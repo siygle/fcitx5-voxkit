@@ -37,6 +37,26 @@ The user service reuses the model files the **Hex** app downloaded
 voxkit's own store instead: `systemctl --user edit voxkit.service` and set
 `VOXKIT_MODELS_DIR`, then `voxkit model install qwen3-asr-0.6b`.
 
+## Speed
+
+Measured on an Intel Core Ultra 5 135U (CPU; Hex found its iGPU slower),
+5 s of speech, release → text, through the socket like the input method:
+
+| | before | now |
+|---|---|---|
+| per dictation | 3.5–4.1 s | **0.95–1.0 s** |
+| first use / after fcitx5 restart | +0.5 s model load | 0 (loaded and warmed at service start) |
+
+What changed (see `daemon/voxkit/examples/bench.rs`, `daemon/bench-client.py`):
+- Vocabulary prompt capped at 40 characters. The prompt is decoded on every
+  run: 80 terms (325 chars) cost +1.25 s. `VOXKIT_PROMPT_CHARS` overrides.
+- 8 ASR threads instead of 4 (−35%). `VOXKIT_THREADS` overrides.
+- Model loaded and warmed once at startup, shared by all connections.
+- OpenCC through libopencc in-process (~1 ms) instead of spawning `opencc` (~80 ms).
+- 120 ms tail after release instead of 200 ms.
+
+Hex (same model, same library) logs 0.8–1.1 s for 3–5 s clips on this machine.
+
 ## Integrating an input method
 
 Nothing is required: while the IM's composition is empty, the module commits

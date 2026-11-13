@@ -14,6 +14,10 @@ PartOf=graphical-session.target
 Type=simple
 Environment=VOXKIT_MODELS_DIR=%h/.local/share/hex/models
 Environment=VOXKIT_MODEL=qwen3-asr-0.6b
+# Tuning (defaults shown): ASR threads = cores-2 capped at 8; prompt budget in
+# characters (each costs ~4 ms of decoding on CPU, 0 disables the prompt).
+#Environment=VOXKIT_THREADS=8
+#Environment=VOXKIT_PROMPT_CHARS=40
 ExecStart=/usr/bin/voxkit serve
 Restart=on-failure
 RestartSec=2

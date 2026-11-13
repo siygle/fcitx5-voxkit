@@ -25,7 +25,9 @@ use crate::models::{self, Kind};
 use crate::protocol::{self, Command};
 use crate::vad::rms_dbfs;
 
-const TAIL: Duration = Duration::from_millis(200);
+/// Audio kept after the key is released (the last syllable is often still
+/// being spoken). 120 ms measured enough for push-to-talk; was 200 ms.
+const TAIL: Duration = Duration::from_millis(120);
 
 struct Writer {
     inner: Mutex<BufWriter<UnixStream>>,
@@ -92,6 +94,24 @@ pub fn serve(
     default_model: &str,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    // One engine for the daemon: the model is loaded and warmed once at
+    // startup and kept across client reconnects (fcitx5 restarts).
+    let engine = Arc::new(Mutex::new(Transcriber::new(store.to_path_buf())));
+    {
+        let engine = Arc::clone(&engine);
+        let model = default_model.to_string();
+        thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            match engine.prewarm(&model) {
+                Ok(()) => eprintln!(
+                    "voxkit: {model} ready in {} ms",
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => eprintln!("voxkit: prewarm skipped ({err:#})"),
+            }
+        });
+    }
     if socket.exists() {
         match UnixStream::connect(socket) {
             Ok(_) => anyhow::bail!("voxkit is already listening on {}", socket.display()),
@@ -113,8 +133,9 @@ pub fn serve(
             Ok((stream, _)) => {
                 let store = store.to_path_buf();
                 let default_model = default_model.to_string();
+                let engine = Arc::clone(&engine);
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, &store, &default_model) {
+                    if let Err(err) = handle_client(stream, &store, &default_model, engine) {
                         eprintln!("voxkit: client ended: {err:#}");
                     }
                 });
@@ -136,7 +157,12 @@ impl Drop for SocketFile {
     }
 }
 
-fn handle_client(stream: UnixStream, store: &Path, default_model: &str) -> anyhow::Result<()> {
+fn handle_client(
+    stream: UnixStream,
+    store: &Path,
+    default_model: &str,
+    engine: Arc<Mutex<Transcriber>>,
+) -> anyhow::Result<()> {
     stream.set_nonblocking(false)?;
     let writer = Arc::new(Writer {
         inner: Mutex::new(BufWriter::new(stream.try_clone()?)),
@@ -151,7 +177,7 @@ fn handle_client(stream: UnixStream, store: &Path, default_model: &str) -> anyho
         let control = Arc::clone(&control);
         let store = store.to_path_buf();
         let default_model = default_model.to_string();
-        thread::spawn(move || worker_loop(rx, writer, control, store, default_model))
+        thread::spawn(move || worker_loop(rx, writer, control, store, default_model, engine))
     };
 
     let mut reader = BufReader::new(stream);
@@ -224,8 +250,8 @@ fn worker_loop(
     control: Arc<Control>,
     store: PathBuf,
     default_model: String,
+    engine: Arc<Mutex<Transcriber>>,
 ) {
-    let mut engine = Transcriber::new(store.clone());
     let mut vocabulary = Vec::new();
     let mut active: Option<Active> = None;
     let mut language = "zh".to_string();
@@ -271,6 +297,7 @@ fn worker_loop(
                         continue;
                     }
                 };
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
                 finish(
                     session,
                     &writer,

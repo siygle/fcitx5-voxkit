@@ -22,6 +22,16 @@ pub struct MicCapture {
 
 impl MicCapture {
     pub fn start() -> anyhow::Result<Self> {
+        // Benchmarks/tests: replay a WAV instead of opening the microphone,
+        // so the full daemon path can be timed without speaking.
+        if let Some(path) = std::env::var_os("VOXKIT_TEST_WAV").filter(|p| !p.is_empty()) {
+            let pcm = load_wav_16k(std::path::Path::new(&path))?;
+            return Ok(MicCapture {
+                stream: None,
+                samples: std::sync::Arc::new(Mutex::new(pcm)),
+                rate: TARGET_RATE,
+            });
+        }
         let host = cpal::default_host();
         let device = host
             .default_input_device()

@@ -84,7 +84,7 @@ impl Transcriber {
         }
         let asr = self.asr.as_mut().context("ASR model was not loaded")?;
         asr.session.set_cancel_token(cancel);
-        let prompt = prompt_for(terms, asr.prompt_chars);
+        let prompt = prompt_for(terms, crate::vocab::prompt_budget(asr.prompt_chars));
         let text = match run(asr, &speech, language, &prompt) {
             Err(transcribe_cpp::Error::Aborted { .. }) => return Ok(Outcome::Cancelled),
             Err(transcribe_cpp::Error::InvalidArgument(message)) if !prompt.is_empty() => {
@@ -103,6 +103,20 @@ impl Transcriber {
             return Ok(Outcome::NoSpeech);
         }
         Ok(Outcome::Text(maybe_convert(&text, convert)))
+    }
+
+    /// Load the model and run it once on silence-free noise, so the first
+    /// real dictation does not pay for allocation and kernel warm-up.
+    pub fn prewarm(&mut self, model_id: &str) -> anyhow::Result<()> {
+        self.ensure(model_id)?;
+        if let Some(asr) = self.asr.as_mut() {
+            // 1 s of low noise; the transcript is discarded.
+            let pcm: Vec<f32> = (0..TARGET_RATE as usize)
+                .map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 0.01)
+                .collect();
+            let _ = run(asr, &pcm, "zh", "");
+        }
+        Ok(())
     }
 
     fn ensure(&mut self, model_id: &str) -> anyhow::Result<()> {
@@ -169,10 +183,7 @@ fn load_asr(id: &str, prompt_chars: usize, path: &Path) -> anyhow::Result<Asr> {
         backend: Backend::Cpu,
         ..ModelOptions::default()
     };
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(2)
-        .clamp(1, 4);
+    let threads = asr_threads();
     let model = Model::load_with(path, &options).map_err(|err| anyhow!(err.to_string()))?;
     let session = model
         .session_with(&SessionOptions {
@@ -197,6 +208,24 @@ fn load_asr(id: &str, prompt_chars: usize, path: &Path) -> anyhow::Result<Asr> {
         prompt_chars,
         timestamps,
     })
+}
+
+/// ASR worker threads. ggml scales well past 4 on hybrid CPUs: on a 2P+8E
+/// Core Ultra 5 135U a 5 s clip took 1200 ms at 4, 760 ms at 8, 700-1450 ms
+/// (noisy) at 10-12. Default: available cores minus a couple for the
+/// desktop, capped at 8. Override with VOXKIT_THREADS.
+fn asr_threads() -> i32 {
+    if let Some(n) = std::env::var("VOXKIT_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(2);
+    (cores - 2).clamp(1, 8)
 }
 
 fn load_vad(path: &Path) -> anyhow::Result<Vad> {

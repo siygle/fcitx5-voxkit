@@ -13,6 +13,20 @@ pub const MAX_TERM_CHARS: usize = 64;
 pub const MAX_TERMS: usize = 200;
 pub const WHISPER_PROMPT_CHARS: usize = 500;
 pub const QWEN_PROMPT_CHARS: usize = 1000;
+/// Default prompt budget actually used. The prompt is decoded as context on
+/// every run: on an Intel Core Ultra 5 135U (CPU, 8 threads) a 5 s clip took
+/// 780 ms with no prompt, +90 ms at 39 chars, +310 ms at 81, +610 ms at 162
+/// and +1250 ms at 325. 40 chars keeps names useful and latency close to Hex.
+/// Override with VOXKIT_PROMPT_CHARS (0 disables the prompt).
+pub const DEFAULT_PROMPT_CHARS: usize = 40;
+
+pub fn prompt_budget(model_limit: usize) -> usize {
+    let wanted = std::env::var("VOXKIT_PROMPT_CHARS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PROMPT_CHARS);
+    wanted.min(model_limit)
+}
 
 pub fn prompt_for(terms: &[String], max_chars: usize) -> String {
     let mut out = String::new();
