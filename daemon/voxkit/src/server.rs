@@ -383,7 +383,7 @@ fn begin_capture(
     let spec = models::get(model)
         .filter(|spec| spec.kind == Kind::Asr)
         .ok_or(("bad-model", "unknown model id"))?;
-    if !models::path_for(store, spec).is_file() {
+    if models::locate(store, spec).is_none() {
         return Err(("model-not-ready", "run: voxkit model install"));
     }
     let epoch = control.epoch.fetch_add(1, Ordering::SeqCst) + 1;

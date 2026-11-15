@@ -132,7 +132,7 @@ impl Transcriber {
         }
         if self.vad.is_none() {
             match models::get("silero-vad") {
-                Some(spec) if models::path_for(&self.store, spec).is_file() => {
+                Some(spec) if models::locate(&self.store, spec).is_some() => {
                     let path = models::require_file(&self.store, "silero-vad")?;
                     match load_vad(&path) {
                         Ok(vad) => self.vad = Some(vad),

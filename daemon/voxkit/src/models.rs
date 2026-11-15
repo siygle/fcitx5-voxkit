@@ -81,8 +81,49 @@ pub fn default_asr_id() -> &'static str {
     "whisper-tiny"
 }
 
+/// Where voxkit itself writes this model (download, delete). Never a
+/// read-only fallback directory.
 pub fn path_for(store: &Path, spec: &ModelSpec) -> PathBuf {
     store.join(spec.filename)
+}
+
+/// Read-only directories searched after the store, e.g. the Hex app's model
+/// folder. `VOXKIT_READONLY_MODELS_DIRS` is a `:`-separated list. voxkit only
+/// ever opens files here for reading: download, delete and select always use
+/// the store, so another app's models cannot be changed or removed.
+pub fn readonly_dirs() -> Vec<PathBuf> {
+    env::var_os("VOXKIT_READONLY_MODELS_DIRS")
+        .map(|v| env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Where a usable copy of the model is: `Owned` in the store, or `Borrowed`
+/// from a read-only directory. Borrowed copies are only reported when the
+/// size matches (the checksum is verified when the model is loaded).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Location {
+    Owned(PathBuf),
+    Borrowed(PathBuf),
+}
+
+impl Location {
+    pub fn path(&self) -> &Path {
+        match self {
+            Location::Owned(p) | Location::Borrowed(p) => p,
+        }
+    }
+}
+
+pub fn locate(store: &Path, spec: &ModelSpec) -> Option<Location> {
+    let own = path_for(store, spec);
+    if own.is_file() {
+        return Some(Location::Owned(own));
+    }
+    readonly_dirs().into_iter().find_map(|dir| {
+        let candidate = dir.join(spec.filename);
+        let size_ok = fs::metadata(&candidate).map(|m| m.len() == spec.bytes).unwrap_or(false);
+        (candidate.is_file() && size_ok).then_some(Location::Borrowed(candidate))
+    })
 }
 
 pub fn default_store() -> PathBuf {
@@ -129,6 +170,12 @@ pub fn install(store: &Path, id: &str) -> anyhow::Result<PathBuf> {
         eprintln!("voxkit: {id} already installed ({})", dest.display());
         return Ok(dest);
     }
+    if let Some(Location::Borrowed(path)) = locate(store, spec) {
+        if file_matches(&path, spec)? {
+            eprintln!("voxkit: {id} already available read-only at {}", path.display());
+            return Ok(path);
+        }
+    }
     eprintln!("voxkit: downloading {id}");
     eprintln!("voxkit: {}", spec.blurb);
     eprintln!("voxkit: license: {}", spec.license);
@@ -162,14 +209,16 @@ pub fn install_requested(store: &Path, id: Option<&str>) -> anyhow::Result<()> {
 
 pub fn require_file(store: &Path, id: &str) -> anyhow::Result<PathBuf> {
     let spec = get(id).ok_or_else(|| anyhow!("unknown model '{id}'"))?;
-    let dest = path_for(store, spec);
-    if !dest.is_file() {
+    let Some(found) = locate(store, spec) else {
         anyhow::bail!("model {id} is not installed. run: voxkit model install {id}");
+    };
+    if !file_matches(found.path(), spec)? {
+        anyhow::bail!(
+            "model {id} failed checksum ({}). run: voxkit model install {id}",
+            found.path().display()
+        );
     }
-    if !file_matches(&dest, spec)? {
-        anyhow::bail!("model {id} failed checksum. run: voxkit model install {id}");
-    }
-    Ok(dest)
+    Ok(found.path().to_path_buf())
 }
 
 fn file_matches(path: &Path, spec: &ModelSpec) -> anyhow::Result<bool> {

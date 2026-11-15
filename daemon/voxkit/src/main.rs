@@ -66,12 +66,14 @@ fn model_command(flags: &Flags) -> anyhow::Result<ExitCode> {
 
 fn print_models(store: &std::path::Path) {
     println!("store: {}", store.display());
+    for dir in models::readonly_dirs() {
+        println!("read-only: {}", dir.display());
+    }
     for spec in models::specs() {
-        let installed = models::path_for(store, spec).is_file();
-        let mark = if installed {
-            "installed"
-        } else {
-            "not installed"
+        let mark = match models::locate(store, spec) {
+            Some(models::Location::Owned(_)) => "installed",
+            Some(models::Location::Borrowed(_)) => "read-only",
+            None => "not installed",
         };
         let kind = match spec.kind {
             Kind::Asr => "asr",

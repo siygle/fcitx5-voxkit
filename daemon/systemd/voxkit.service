@@ -1,10 +1,11 @@
 # User unit for the voxkit dictation daemon (installed by fcitx5-voxkit).
 # Enable: systemctl --user enable --now voxkit.service
 #
-# Models: by default this reuses the Qwen3-ASR + Silero files that the Hex
-# app already downloaded (checksums match), read-only. To use voxkit's own
-# store instead, override VOXKIT_MODELS_DIR in a drop-in:
-#   systemctl --user edit voxkit.service
+# Models: voxkit's own store is ~/.local/share/voxkit/models (download,
+# delete, select happen there). The Hex app's model folder is used as a
+# READ-ONLY fallback when it already has a model (checksums verified), so no
+# second 850 MB download is needed. voxkit never writes to it, and systemd
+# below makes that folder read-only for this service as well.
 [Unit]
 Description=voxkit local dictation daemon (fcitx5-voxkit)
 After=graphical-session.target pipewire.service
@@ -12,7 +13,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-Environment=VOXKIT_MODELS_DIR=%h/.local/share/hex/models
+Environment=VOXKIT_MODELS_DIR=%h/.local/share/voxkit/models
+Environment=VOXKIT_READONLY_MODELS_DIRS=%h/.local/share/hex/models
 Environment=VOXKIT_MODEL=qwen3-asr-0.6b
 # Tuning (defaults shown): ASR threads = cores-2 capped at 8; prompt budget in
 # characters (each costs ~4 ms of decoding on CPU, 0 disables the prompt).
@@ -21,10 +23,13 @@ Environment=VOXKIT_MODEL=qwen3-asr-0.6b
 ExecStart=/usr/bin/voxkit serve
 Restart=on-failure
 RestartSec=2
-# Read the models, write nothing outside the runtime dir.
+# Read the models; write only the runtime dir (socket) and voxkit's own store.
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%t
+# Creates ~/.local/share/voxkit (user units: StateDirectory = $XDG_STATE_HOME,
+# so use the data dir explicitly) before the sandbox is set up.
+ExecStartPre=+/usr/bin/mkdir -p %h/.local/share/voxkit/models
+ReadWritePaths=%t -%h/.local/share/voxkit/models
 PrivateTmp=yes
 NoNewPrivileges=yes
 

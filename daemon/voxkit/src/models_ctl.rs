@@ -126,6 +126,14 @@ pub fn remove(store: &Path, id: &str) -> Result<(), (String, String)> {
         }
     }
     let dest = models::path_for(store, spec);
+    if !dest.is_file() {
+        if let Some(models::Location::Borrowed(path)) = models::locate(store, spec) {
+            return Err((
+                "read-only".into(),
+                format!("{id} is provided read-only by {}; voxkit does not delete it", path.display()),
+            ));
+        }
+    }
     if dest.is_file() {
         fs::remove_file(&dest).map_err(|err| ("io".into(), err.to_string()))?;
     }
@@ -140,10 +148,12 @@ fn run_download(store: PathBuf, id: String) {
     let outcome = (|| -> Result<(), String> {
         let spec = models::get(&id).ok_or_else(|| format!("unknown model '{id}'"))?;
         fs::create_dir_all(&store).map_err(|err| err.to_string())?;
-        let dest = models::path_for(&store, spec);
-        if dest.is_file() && file_ok(&dest, spec.bytes, spec.sha256)? {
-            return Ok(());
+        if let Some(found) = models::locate(&store, spec) {
+            if file_ok(found.path(), spec.bytes, spec.sha256)? {
+                return Ok(());  // already usable (owned or read-only)
+            }
         }
+        let dest = models::path_for(&store, spec);
         let partial = store.join(format!("{}.partial", spec.filename));
         download(&spec.url, &partial, spec.bytes)?;
         if cancel_flag().load(Ordering::SeqCst) {
@@ -248,9 +258,23 @@ fn directory_bytes(store: &Path) -> u64 {
 }
 
 fn row(store: &Path, spec: &models::ModelSpec, active: &str) -> Value {
-    let path = models::path_for(store, spec);
-    let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-    let installed = path.is_file() && size == spec.bytes;
+    let found = models::locate(store, spec);
+    let size = found
+        .as_ref()
+        .and_then(|f| fs::metadata(f.path()).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let installed = found.is_some() && size == spec.bytes;
+    let source = match &found {
+        Some(models::Location::Owned(_)) => "store",
+        Some(models::Location::Borrowed(_)) => "read-only",
+        None => "",
+    };
+    // Disk use counts only files voxkit owns.
+    let owned_size = match &found {
+        Some(models::Location::Owned(_)) => size,
+        _ => 0,
+    };
     json!({
         "id": spec.id,
         "kind": match spec.kind {
@@ -258,8 +282,10 @@ fn row(store: &Path, spec: &models::ModelSpec, active: &str) -> Value {
             Kind::Vad => "vad",
         },
         "bytes": spec.bytes,
-        "size_on_disk": if installed { size } else { 0 },
+        "size_on_disk": owned_size,
         "installed": installed,
+        "source": source,
+        "removable": source == "store",
         "active": spec.id == active,
         "blurb": spec.blurb,
     })
@@ -322,4 +348,86 @@ fn job_state() -> String {
         .unwrap_or_else(|err| err.into_inner())
         .state
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    //! A read-only model directory (e.g. Hex's) must never be written to:
+    //! not by remove, select, list, or a download that finds a usable copy.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Tiny fake spec matching a real catalog entry is not possible (sizes are
+    /// pinned), so these tests drive the code paths with real specs and
+    /// sparse files of the exact size.
+    fn snapshot(dir: &Path) -> BTreeMap<String, (u64, std::time::SystemTime)> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                let m = e.metadata().unwrap();
+                (e.file_name().to_string_lossy().into_owned(), (m.len(), m.modified().unwrap()))
+            })
+            .collect()
+    }
+
+    // One test: VOXKIT_READONLY_MODELS_DIRS is process-global.
+    #[test]
+    fn readonly_dir_is_never_modified() {
+        let root = std::env::temp_dir().join(format!("voxkit-ro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let hex = root.join("hex");
+        fs::create_dir_all(&hex).unwrap();
+        let spec = models::get("silero-vad").unwrap();
+        // Same name and size as the real file (content does not matter here).
+        let borrowed = hex.join(spec.filename);
+        File::create(&borrowed).unwrap().set_len(spec.bytes).unwrap();
+        std::env::set_var("VOXKIT_READONLY_MODELS_DIRS", &hex);
+        let before = snapshot(&hex);
+
+        // Located as a read-only copy, reported as such, not removable.
+        assert_eq!(
+            models::locate(&store, spec),
+            Some(models::Location::Borrowed(borrowed.clone()))
+        );
+        let list = list_value(1, &store);
+        let row = list["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == spec.id)
+            .unwrap()
+            .clone();
+        assert_eq!(row["installed"], true);
+        assert_eq!(row["source"], "read-only");
+        assert_eq!(row["removable"], false);
+        assert_eq!(row["size_on_disk"], 0);
+
+        // Remove refuses and leaves the file alone.
+        let err = remove(&store, spec.id).unwrap_err();
+        assert_eq!(err.0, "read-only");
+        assert!(borrowed.is_file());
+
+        // Select writes only into the store.
+        init_selected(&store, "qwen3-asr-0.6b");
+        select(&store, "qwen3-asr-0.6b").unwrap();
+        assert!(store.join("selected.txt").is_file());
+
+        // An owned copy shadows the read-only one; removing deletes only it.
+        fs::create_dir_all(&store).unwrap();
+        let owned = models::path_for(&store, spec);
+        File::create(&owned).unwrap().set_len(spec.bytes).unwrap();
+        assert_eq!(
+            models::locate(&store, spec),
+            Some(models::Location::Owned(owned.clone()))
+        );
+        remove(&store, spec.id).unwrap();
+        assert!(!owned.exists());
+        assert!(borrowed.is_file());
+
+        assert_eq!(snapshot(&hex), before, "read-only dir changed");
+        std::env::remove_var("VOXKIT_READONLY_MODELS_DIRS");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
