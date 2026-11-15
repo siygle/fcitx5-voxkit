@@ -22,6 +22,7 @@ use transcribe_cpp::CancelToken;
 use crate::audio::MicCapture;
 use crate::engine::{Outcome, Transcriber};
 use crate::models::{self, Kind};
+use crate::models_ctl;
 use crate::protocol::{self, Command};
 use crate::vad::rms_dbfs;
 
@@ -96,6 +97,7 @@ pub fn serve(
 ) -> anyhow::Result<()> {
     // One engine for the daemon: the model is loaded and warmed once at
     // startup and kept across client reconnects (fcitx5 restarts).
+    models_ctl::init_selected(store, default_model);
     let engine = Arc::new(Mutex::new(Transcriber::new(store.to_path_buf())));
     {
         let engine = Arc::clone(&engine);
@@ -234,6 +236,54 @@ fn handle_client(
                     break;
                 }
             }
+            Ok(Command::ModelList { req }) => {
+                writer.send(&models_ctl::list_value(req, store));
+            }
+            Ok(Command::ModelStatus { req }) => {
+                writer.send(&models_ctl::status_value(req, store));
+            }
+            Ok(Command::ModelProgress { req }) => {
+                writer.send(&models_ctl::progress_value(req));
+            }
+            Ok(Command::ModelCancel { req }) => {
+                models_ctl::cancel();
+                writer.send(&models_ctl::progress_value(req));
+            }
+            Ok(Command::ModelInstall { req, model }) => match models_ctl::begin(store.to_path_buf(), model) {
+                Ok(()) => {
+                    writer.send(&models_ctl::progress_value(req));
+                }
+                Err((code, message)) => {
+                    writer.send(&protocol::error(req, &code, &message));
+                }
+            },
+            Ok(Command::ModelRemove { req, model }) => match models_ctl::remove(store, &model) {
+                Ok(()) => {
+                    writer.send(&serde_json::json!({
+                        "v": 1,
+                        "type": "model.remove",
+                        "req": req,
+                        "model": model,
+                        "installed": false
+                    }));
+                }
+                Err((code, message)) => {
+                    writer.send(&protocol::error(req, &code, &message));
+                }
+            },
+            Ok(Command::ModelSelect { req, model }) => match models_ctl::select(store, &model) {
+                Ok(()) => {
+                    writer.send(&serde_json::json!({
+                        "v": 1,
+                        "type": "model.select",
+                        "req": req,
+                        "model": model
+                    }));
+                }
+                Err((code, message)) => {
+                    writer.send(&protocol::error(req, &code, &message));
+                }
+            },
             Err(message) => {
                 writer.send(&protocol::error(0, "bad-request", &message));
             }
@@ -276,6 +326,11 @@ fn worker_loop(
                 convert = mode;
                 if let Some(id) = requested {
                     model = id;
+                } else {
+                    let chosen = models_ctl::selected();
+                    if !chosen.is_empty() {
+                        model = chosen;
+                    }
                 }
                 match begin_capture(&writer, &control, &store, req, &model) {
                     Ok(session) => active = Some(session),

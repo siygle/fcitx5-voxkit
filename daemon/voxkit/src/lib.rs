@@ -7,6 +7,7 @@ pub mod audio;
 pub mod convert;
 pub mod engine;
 pub mod models;
+pub mod models_ctl;
 pub mod protocol;
 pub mod server;
 pub mod vad;

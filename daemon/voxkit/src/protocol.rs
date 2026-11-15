@@ -27,6 +27,30 @@ pub enum Command {
     Ping {
         req: u64,
     },
+    ModelList {
+        req: u64,
+    },
+    ModelInstall {
+        req: u64,
+        model: String,
+    },
+    ModelProgress {
+        req: u64,
+    },
+    ModelCancel {
+        req: u64,
+    },
+    ModelRemove {
+        req: u64,
+        model: String,
+    },
+    ModelSelect {
+        req: u64,
+        model: String,
+    },
+    ModelStatus {
+        req: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +95,22 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
             vocabulary: incoming.vocabulary,
         }),
         "ping" => Ok(Command::Ping { req }),
+        "model.list" => Ok(Command::ModelList { req }),
+        "model.install" => Ok(Command::ModelInstall {
+            req,
+            model: incoming.model.unwrap_or_default(),
+        }),
+        "model.progress" => Ok(Command::ModelProgress { req }),
+        "model.cancel" => Ok(Command::ModelCancel { req }),
+        "model.remove" => Ok(Command::ModelRemove {
+            req,
+            model: incoming.model.unwrap_or_default(),
+        }),
+        "model.select" => Ok(Command::ModelSelect {
+            req,
+            model: incoming.model.unwrap_or_default(),
+        }),
+        "model.status" => Ok(Command::ModelStatus { req }),
         other => Err(format!("unknown message type '{other}'")),
     }
 }
@@ -138,6 +178,23 @@ mod tests {
         assert_eq!(value["type"], "final");
         assert_eq!(value["text"], "你好");
         assert_eq!(value["req"], 3);
+    }
+
+    #[test]
+    fn model_list_is_version_1() {
+        let command = parse_command(r#"{"v":1,"type":"model.list","req":3}"#).unwrap();
+        assert!(matches!(command, Command::ModelList { req: 3 }));
+        let command = parse_command(
+            r#"{"v":1,"type":"model.select","req":4,"model":"whisper-tiny"}"#,
+        )
+        .unwrap();
+        match command {
+            Command::ModelSelect { req, model } => {
+                assert_eq!(req, 4);
+                assert_eq!(model, "whisper-tiny");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
