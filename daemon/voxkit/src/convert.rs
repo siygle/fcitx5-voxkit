@@ -62,16 +62,41 @@ pub fn convert_s2twp(text: &str) -> Result<String, String> {
 }
 
 fn opencc_config() -> Option<PathBuf> {
-    for candidate in [
-        "/usr/share/opencc/s2twp.json",
-        "/usr/local/share/opencc/s2twp.json",
-    ] {
-        let path = PathBuf::from(candidate);
+    let mut candidates = Vec::new();
+    if let Some(dir) = env::var_os("OPENCC_DATA_DIR").filter(|dir| !dir.is_empty()) {
+        candidates.push(PathBuf::from(dir).join("s2twp.json"));
+    }
+    candidates.push(PathBuf::from("/usr/share/opencc/s2twp.json"));
+    candidates.push(PathBuf::from("/usr/local/share/opencc/s2twp.json"));
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from("/opt/homebrew/share/opencc/s2twp.json"));
+        if let Some(home) = env::var_os("HOME").filter(|home| !home.is_empty()) {
+            candidates.push(PathBuf::from(home).join("homebrew/share/opencc/s2twp.json"));
+        }
+    }
+    for path in candidates {
         if path.is_file() {
             return Some(path);
         }
     }
     None
+}
+
+fn dylib_names() -> &'static [&'static std::ffi::CStr] {
+    #[cfg(target_os = "macos")]
+    {
+        return &[
+            c"libopencc.1.dylib",
+            c"libopencc.dylib",
+            c"/opt/homebrew/lib/libopencc.1.dylib",
+            c"/usr/local/lib/libopencc.1.dylib",
+        ];
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        &[c"libopencc.so.1.4", c"libopencc.so.1", c"libopencc.so"]
+    }
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -120,7 +145,7 @@ impl LibOpenCc {
     fn load() -> Option<Self> {
         let config = opencc_config()?;
         let config = std::ffi::CString::new(config.to_str()?).ok()?;
-        for name in [c"libopencc.so.1.4", c"libopencc.so.1", c"libopencc.so"] {
+        for name in dylib_names() {
             let lib = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
             if lib.is_null() {
                 continue;
