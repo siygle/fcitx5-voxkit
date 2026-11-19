@@ -62,7 +62,7 @@ handle_ = voxkit()->call<fcitx::IVoxkit::registerInputMethod>(
 CMake: `find_package(Fcitx5ModuleVoxkit)` → `Fcitx5::Module::Voxkit`, and add
 `voxkit` to `[Addon/OptionalDependencies]`.
 
-Integrated: [siygle/fcitx5-chewing-plus](https://github.com/siygle/fcitx5-chewing-plus) (`plus` branch).
+Integrated: [siygle/chewing-plus](https://github.com/siygle/chewing-plus) (fcitx5, IBus and macOS; it bundles this daemon).
 
 ## Build & test
 

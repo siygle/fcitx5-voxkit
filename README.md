@@ -9,7 +9,7 @@
 - **繁體中文**：自動轉換成台灣用語的繁體中文
 - **速度**：5 秒的語音，放開後約 1 秒出字
 - **本機辨識**：使用 Qwen3-ASR 語音模型，不需要網路，錄音不會離開電腦
-- **與輸入法整合**：搭配 [fcitx5-chewing-plus](https://github.com/siygle/fcitx5-chewing-plus) 時，
+- **與輸入法整合**：搭配 [新酷音 Plus（chewing-plus）](https://github.com/siygle/chewing-plus) 時，
   - 結果會插入游標位置，前後打好的字都會保留
   - 會參考你自己加的詞，提高專有名詞的辨識率
 - **其他輸入法**：沒有特別整合的輸入法也能使用，在組字區為空時直接輸出
