@@ -119,6 +119,16 @@ impl Transcriber {
         Ok(())
     }
 
+    /// Load the model (and Silero) without running it. Called when the
+    /// push-to-talk key goes down, so loading overlaps the recording.
+    pub fn preload(&mut self, model_id: &str) -> anyhow::Result<()> {
+        self.ensure(model_id)
+    }
+
+    pub fn loaded_model(&self) -> Option<&str> {
+        self.asr.as_ref().map(|asr| asr.id.as_str())
+    }
+
     fn ensure(&mut self, model_id: &str) -> anyhow::Result<()> {
         ensure_runtime()?;
         if self.asr.as_ref().map(|asr| asr.id.as_str()) != Some(model_id) {
@@ -178,6 +188,16 @@ impl Transcriber {
     }
 }
 
+impl crate::lifecycle::Unload for Transcriber {
+    fn loaded(&self) -> bool {
+        self.asr.is_some() || self.vad.is_some()
+    }
+    fn unload(&mut self) {
+        self.asr = None;
+        self.vad = None;
+    }
+}
+
 fn load_asr(id: &str, prompt_chars: usize, path: &Path) -> anyhow::Result<Asr> {
     let options = ModelOptions {
         backend: Backend::Cpu,
@@ -214,7 +234,7 @@ fn load_asr(id: &str, prompt_chars: usize, path: &Path) -> anyhow::Result<Asr> {
 /// Core Ultra 5 135U a 5 s clip took 1200 ms at 4, 760 ms at 8, 700-1450 ms
 /// (noisy) at 10-12. Default: available cores minus a couple for the
 /// desktop, capped at 8. Override with VOXKIT_THREADS.
-fn asr_threads() -> i32 {
+pub fn asr_threads() -> i32 {
     if let Some(n) = std::env::var("VOXKIT_THREADS")
         .ok()
         .and_then(|v| v.trim().parse::<i32>().ok())

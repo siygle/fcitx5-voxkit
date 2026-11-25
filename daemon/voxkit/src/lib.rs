@@ -6,10 +6,12 @@
 pub mod audio;
 pub mod convert;
 pub mod engine;
+pub mod lifecycle;
 pub mod models;
 pub mod models_ctl;
 pub mod protocol;
 pub mod server;
+pub mod translate;
 pub mod vad;
 pub mod vocab;
 

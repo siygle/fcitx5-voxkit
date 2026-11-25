@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context};
 
 use voxkit::audio::load_wav_16k;
 use voxkit::engine::{Outcome, Transcriber};
-use voxkit::models::{self, Kind};
+use voxkit::models;
 use voxkit::server;
 use voxkit::vocab;
 use voxkit::{default_socket, default_store};
@@ -40,6 +40,7 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         "model" => model_command(&flags),
         "transcribe" => transcribe_command(&flags),
+        "translate" => translate_command(&flags),
         other => Err(anyhow!("unknown command '{other}'. {HELP}")),
     }
 }
@@ -75,10 +76,7 @@ fn print_models(store: &std::path::Path) {
             Some(models::Location::Borrowed(_)) => "read-only",
             None => "not installed",
         };
-        let kind = match spec.kind {
-            Kind::Asr => "asr",
-            Kind::Vad => "vad",
-        };
+        let kind = spec.kind.as_str();
         println!("{:<16} {:<13} {:<12} {}", spec.id, kind, mark, spec.blurb);
         println!("  {}", spec.license);
     }
@@ -102,10 +100,23 @@ fn transcribe_command(flags: &Flags) -> anyhow::Result<ExitCode> {
         &flags.model,
         &flags.language,
         &terms,
-        &flags.convert,
+        if flags.translate.is_some() {
+            "none"
+        } else {
+            &flags.convert
+        },
         &transcribe_cpp::CancelToken::new(),
     )?;
     match outcome {
+        Outcome::Text(text) if flags.translate.is_some() => {
+            eprintln!(
+                "voxkit: {} in {:.1}s: {text}",
+                flags.model,
+                started.elapsed().as_secs_f32()
+            );
+            let target = flags.translate.as_deref().unwrap_or("en");
+            Ok(print_translation(flags, &text, target))
+        }
         Outcome::Text(text) => {
             eprintln!(
                 "voxkit: {} in {:.1}s, {} chars",
@@ -127,6 +138,61 @@ fn transcribe_command(flags: &Flags) -> anyhow::Result<ExitCode> {
     }
 }
 
+/// `voxkit translate TEXT`: run the translation stage alone (no microphone).
+/// Exit 0 when translated, 3 when it fell back to the original text.
+fn translate_command(flags: &Flags) -> anyhow::Result<ExitCode> {
+    let text = flags.positionals.join(" ");
+    if text.trim().is_empty() {
+        return Err(anyhow!("usage: voxkit translate [--target en] TEXT"));
+    }
+    let target = flags.translate.as_deref().unwrap_or("en");
+    Ok(print_translation(flags, &text, target))
+}
+
+fn print_translation(flags: &Flags, text: &str, target: &str) -> ExitCode {
+    let mut translator = voxkit::translate::Translator::new(&flags.store);
+    let cancel = std::sync::atomic::AtomicI32::new(0);
+    // First use may only start the download; wait for it on the CLI.
+    loop {
+        match translator.ensure() {
+            Err(voxkit::translate::Failure::ModelDownloading) => {
+                eprintln!("voxkit: waiting for the translation model download (or run `voxkit model install hy-mt1.5-1.8b`)");
+                if !voxkit::models_ctl::downloading(translator.model_id()) {
+                    break;
+                }
+                while voxkit::models_ctl::downloading(translator.model_id()) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+            _ => break,
+        }
+    }
+    let started = Instant::now();
+    let out = voxkit::translate::run(
+        &mut translator,
+        text,
+        &flags.language,
+        &flags.convert,
+        target,
+        &cancel,
+    );
+    eprintln!(
+        "voxkit: translate -> {target} in {:.1}s, translated={} error={}",
+        started.elapsed().as_secs_f32(),
+        out.translated,
+        out.error
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("{}", out.text);
+    if out.translated {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    }
+}
+
 struct Flags {
     store: PathBuf,
     socket: PathBuf,
@@ -134,6 +200,7 @@ struct Flags {
     language: String,
     convert: String,
     vocab_dir: Option<PathBuf>,
+    translate: Option<String>,
     positionals: Vec<String>,
 }
 
@@ -146,6 +213,7 @@ impl Flags {
         let mut language = "zh".to_string();
         let mut convert = "none".to_string();
         let mut vocab_dir = None;
+        let mut translate = None;
         let mut positionals = Vec::new();
         let mut index = 0;
         while index < args.len() {
@@ -163,6 +231,7 @@ impl Flags {
                 "--language" => language = value(&mut index)?,
                 "--convert" => convert = value(&mut index)?,
                 "--vocab-dir" => vocab_dir = Some(PathBuf::from(value(&mut index)?)),
+                "--translate" | "--target" => translate = Some(value(&mut index)?),
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -182,6 +251,7 @@ impl Flags {
             language,
             convert,
             vocab_dir,
+            translate,
             positionals,
         })
     }
@@ -198,10 +268,19 @@ Usage:
   voxkit model list [--store DIR]
   voxkit model install [ID] [--store DIR]
   voxkit transcribe FILE.wav [--model ID] [--language zh] [--convert none|s2twp]
-                             [--vocab-dir DIR] [--store DIR]
+                             [--vocab-dir DIR] [--store DIR] [--translate LANG]
+  voxkit translate TEXT [--target en|ja|ko|zh-Hant|...] [--language zh]
+                        [--convert none|s2twp] [--store DIR]
 
 The default model is whisper-tiny. `model install` with no id installs that
-model and Silero VAD. Nothing is downloaded until install is explicit.
+model and Silero VAD. Speech models are downloaded only by `model install`.
+The translation model (hy-mt1.5-1.8b, ~1.1 GB) is downloaded on first use of
+translation, or with `voxkit model install hy-mt1.5-1.8b`. Translation needs
+the optional plugin libvoxkit-mt (searched in $VOXKIT_MT_PLUGIN,
+<exe>/../lib/voxkit/, /usr/lib/voxkit/).
+
+Models load on first use and unload after VOXKIT_IDLE_UNLOAD seconds idle
+(default 600; `never` keeps them; VOXKIT_MT_IDLE_UNLOAD for translation only).
 
 Paths:
   models   $VOXKIT_MODELS_DIR or $XDG_DATA_HOME/voxkit/models
