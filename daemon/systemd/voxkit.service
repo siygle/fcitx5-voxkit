@@ -20,6 +20,13 @@ Environment=VOXKIT_MODEL=qwen3-asr-0.6b
 # characters (each costs ~4 ms of decoding on CPU, 0 disables the prompt).
 #Environment=VOXKIT_THREADS=8
 #Environment=VOXKIT_PROMPT_CHARS=40
+# Models load on first use (preloading starts when the hotkey goes down) and
+# are unloaded after this many idle seconds; "never" keeps them in memory.
+# VOXKIT_MT_IDLE_UNLOAD overrides it for the translation model only.
+#Environment=VOXKIT_IDLE_UNLOAD=600
+#Environment=VOXKIT_MT_IDLE_UNLOAD=600
+# VOXKIT_PREWARM=1 restores the old behaviour: load the speech model at start.
+#Environment=VOXKIT_PREWARM=1
 ExecStart=/usr/bin/voxkit serve
 Restart=on-failure
 RestartSec=2

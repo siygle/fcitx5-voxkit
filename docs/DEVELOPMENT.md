@@ -27,13 +27,14 @@ Measured on an Intel Core Ultra 5 135U (CPU; Hex found its iGPU slower),
 | | before | now |
 |---|---|---|
 | per dictation | 3.5–4.1 s | **0.95–1.0 s** |
-| first use / after fcitx5 restart | +0.5 s model load | 0 (loaded and warmed at service start) |
+| first use / after fcitx5 restart | +0.5 s model load | load starts at key down, overlapping speech (was: loaded at service start; `VOXKIT_PREWARM=1` restores that) |
 
 What changed (see `daemon/voxkit/examples/bench.rs`, `daemon/bench-client.py`):
 - Vocabulary prompt capped at 40 characters. The prompt is decoded on every
   run: 80 terms (325 chars) cost +1.25 s. `VOXKIT_PROMPT_CHARS` overrides.
 - 8 ASR threads instead of 4 (−35%). `VOXKIT_THREADS` overrides.
-- Model loaded and warmed once at startup, shared by all connections.
+- Model shared by all connections; loaded at key down and unloaded after
+  `VOXKIT_IDLE_UNLOAD` idle seconds (default 600). See docs/TRANSLATION.md.
 - OpenCC through libopencc in-process (~1 ms) instead of spawning `opencc` (~80 ms).
 - 120 ms tail after release instead of 200 ms.
 

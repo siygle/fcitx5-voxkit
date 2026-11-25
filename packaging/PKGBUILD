@@ -1,5 +1,6 @@
 # Builds fcitx5-voxkit (module + voxkit daemon) from this checkout.
-pkgname=fcitx5-voxkit
+pkgbase=fcitx5-voxkit
+pkgname=(fcitx5-voxkit fcitx5-voxkit-translate)
 pkgver=0.1.0.r1.g5ef9521
 pkgrel=1
 pkgdesc="Push-to-talk local dictation for any fcitx5 input method (voxkit daemon + module)"
@@ -22,11 +23,27 @@ build() {
   # Cargo.lock is committed; no network beyond crates already in ~/.cargo.
   cargo build --release --locked --manifest-path "$_src/daemon/Cargo.toml" \
     --target-dir "$srcdir/cargo-target"
+  # Optional translation plugin (llama.cpp + its own ggml, pinned in
+  # daemon/mt-plugin/LLAMA_PIN). LLAMA_CPP_SOURCE_DIR may point at a checkout
+  # of that commit; otherwise CMake downloads it.
+  local llama=(-DVOXKIT_MT_FETCH=ON)
+  [[ -n ${LLAMA_CPP_SOURCE_DIR:-} ]] && llama=(-DLLAMA_CPP_SOURCE_DIR="$LLAMA_CPP_SOURCE_DIR")
+  cmake -S "$_src/daemon/mt-plugin" -B build-mt -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr "${llama[@]}" \
+    -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_F16C=ON -DGGML_AVX2=ON \
+    -DGGML_FMA=ON -DGGML_BMI2=ON -DGGML_AVX512=OFF
+  cmake --build build-mt
 }
-package() {
+package_fcitx5-voxkit() {
   DESTDIR="$pkgdir" cmake --install build
   install -Dm755 "$srcdir/cargo-target/release/voxkit" "$pkgdir/usr/bin/voxkit"
   install -Dm644 "$_src/daemon/systemd/voxkit.service" "$pkgdir/usr/lib/systemd/user/voxkit.service"
   install -Dm644 "$_src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$_src/daemon/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+}
+package_fcitx5-voxkit-translate() {
+  pkgdesc="Optional voice-translation plugin for the voxkit daemon (llama.cpp, CPU)"
+  depends=(fcitx5-voxkit gcc-libs glibc)
+  DESTDIR="$pkgdir" cmake --install build-mt
+  install -Dm644 "$_src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

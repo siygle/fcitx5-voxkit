@@ -44,6 +44,17 @@
 | 按住說話的按鍵 | 右 Alt | 只能設定修飾鍵（Alt、Ctrl、Shift、Super） |
 | 轉換為繁體中文 | 開 | 使用 OpenCC 轉成台灣用語 |
 | 忽略短按（毫秒） | 250 | 短於這個時間的按壓不會觸發 |
+| 啟用語音翻譯 | 關 | 按住翻譯鍵說中文，輸入譯文 |
+| 按住翻譯的按鍵 | 右 Ctrl | 只能設定修飾鍵。右 Shift 留給新酷音 Plus 的英文模式 |
+| 翻譯成 | `en` | `en`、`ja`、`ko`、`zh-Hant`、`zh-Hans`、`fr`、`de`、`es`… |
+
+## 語音翻譯（實驗）
+
+按住翻譯鍵說話，放開後先辨識，再由本機翻譯模型翻成指定語言輸入。細節見 [docs/TRANSLATION.md](docs/TRANSLATION.md)。
+
+- 需要選用的翻譯外掛 `libvoxkit-mt.so`（套件 `fcitx5-voxkit-translate` 或 `chewing-plus-translate`）。
+- 翻譯模型 HY-MT1.5-1.8B（約 1.1 GB）在第一次使用時下載；下載完成前會先輸入原文。也可以先手動下載：`voxkit model install hy-mt1.5-1.8b`。
+- 翻譯失敗時一律輸入原文，並短暫提示原因。
 
 ## 語音模型
 
