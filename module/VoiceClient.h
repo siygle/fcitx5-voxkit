@@ -32,6 +32,13 @@ struct VoiceEvent {
   std::string code;
   std::string message;
   double rms = 0;
+  // Final of a translate request: `text` is the translation, or the
+  // original transcript when `translated` is false (`translateError` says
+  // why: plugin-missing, model-downloading, translate-failed, ...).
+  bool translateMode = false;
+  bool translated = false;
+  std::string translateError;
+  std::string source;
 };
 
 // Reads the user phrase files the daemon should bias toward. `data.txt`
@@ -54,10 +61,22 @@ class VoiceClient {
 
   // false when the daemon socket is not accepting connections.
   bool start(uint64_t req, const std::vector<std::string>& vocabulary, bool traditional);
+  // `translate` sends mode "translate" with `target`. Only call it after
+  // supportsTranslate(): an older daemon would ignore the fields and dictate.
+  bool start(uint64_t req, const std::vector<std::string>& vocabulary, bool traditional,
+             bool translate, const std::string& target);
+
+  // Whether the daemon lists "translate" in model.status capabilities.
+  // Connects if needed and asks once per connection (blocks up to
+  // `timeoutMs` on the first call). false when the daemon is down or old.
+  bool supportsTranslate(int timeoutMs = 400);
+  bool connected() const { return fd_ >= 0; }
   void stop(uint64_t req);
   void cancel(uint64_t req);
 
  private:
+  bool ensureConnected();
+  bool probeCapabilities(int timeoutMs);
   void armIo();
   void onIo();
   void flushOut();
@@ -72,6 +91,8 @@ class VoiceClient {
   std::string outbuf_;
   std::unique_ptr<fcitx::EventSourceIO> io_;
   uint64_t activeReq_ = 0;
+  enum class Caps { Unknown, None, Translate };
+  Caps caps_ = Caps::Unknown;
 };
 
 }  // namespace McBopomofo

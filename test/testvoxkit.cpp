@@ -13,6 +13,7 @@
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/log.h>
+#include <fcitx-config/rawconfig.h>
 #include <fcitx-utils/testing.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/event.h>
@@ -70,6 +71,17 @@ struct Harness {
 const Key kAltR(FcitxKey_Alt_R);
 // fcitx reports the modifier state on the modifier's own release.
 const Key kAltRUp(FcitxKey_Alt_R, KeyState::Alt);
+const Key kCtrlR(FcitxKey_Control_R);
+const Key kCtrlRUp(FcitxKey_Control_R, KeyState::Ctrl);
+
+size_t count(const std::string &haystack, const std::string &needle) {
+    size_t n = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos;
+         at = haystack.find(needle, at + needle.size())) {
+        ++n;
+    }
+    return n;
+}
 
 // One tick = 100 ms.
 bool tick(Harness &h) {
@@ -133,6 +145,60 @@ bool tick(Harness &h) {
         break;
     case 29:
         check(h.committed == expected, "after unregister: commits again");
+        h.committed.clear();
+        // Translation is off by default: Right Ctrl does nothing.
+        h.key(kCtrlR, false);
+        check(h.aux().empty(), "translate key ignored while translation is off");
+        h.key(kCtrlRUp, true);
+        break;
+    case 31: {
+        check(count(readFile(std::getenv("FAKE_LOG")), "\"translate\"") == 0,
+              "nothing sent for the translate key while off");
+        RawConfig raw;
+        h.voxkit->getConfig()->save(raw);
+        raw.setValueByPath("TranslateEnabled", "True");
+        raw.setValueByPath("TranslateTarget", "ja");
+        h.voxkit->setConfig(raw);
+        h.key(kCtrlR, false);
+        check(h.aux().find("翻譯聆聽") != std::string::npos,
+              "hold Right Ctrl: translate listening status, got [" + h.aux() + "]");
+        break;
+    }
+    case 35:
+        h.key(kCtrlRUp, true);
+        check(h.aux().find("翻譯中") != std::string::npos,
+              "release: translating status, got [" + h.aux() + "]");
+        break;
+    case 39: {
+        check(h.committed == "[ja] Nice weather today",
+              "translation committed, got [" + h.committed + "]");
+        const std::string log = readFile(std::getenv("FAKE_LOG"));
+        check(log.find("\"model.status\"") != std::string::npos,
+              "capabilities asked before translating");
+        check(log.find("\"mode\": \"translate\"") != std::string::npos &&
+                  log.find("\"target\": \"ja\"") != std::string::npos,
+              "start carries mode=translate and target=ja");
+        h.committed.clear();
+        // Now pretend to be an older daemon: no "translate" capability.
+        std::fclose(std::fopen((std::string(std::getenv("VOXKIT_SOCKET")) + ".nocaps").c_str(), "w"));
+        h.key(kAltR, false);  // a dictation round; the fake hangs up after it
+        break;
+    }
+    case 43:
+        h.key(kAltRUp, true);
+        break;
+    case 47:
+        check(h.committed == expected, "dictation still works");
+        h.committed.clear();
+        h.key(kCtrlR, false);
+        check(h.aux().find("不支援翻譯") != std::string::npos,
+              "old daemon: translate refused, got [" + h.aux() + "]");
+        h.key(kCtrlRUp, true);
+        break;
+    case 50:
+        check(count(readFile(std::getenv("FAKE_LOG")), "\"mode\": \"translate\"") == 1,
+              "no translate start sent to the old daemon");
+        check(h.committed.empty(), "nothing committed for the refused round");
         h.timer->setEnabled(false);
         std::printf(failures ? "VOXKIT TESTS FAILED (%d)\n" : "VOXKIT TESTS OK\n",
                     failures);

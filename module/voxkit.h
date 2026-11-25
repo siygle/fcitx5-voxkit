@@ -38,7 +38,21 @@ FCITX_CONFIGURATION(
     Option<bool> traditional{this, "Traditional",
                              _("Convert to Traditional Chinese (OpenCC s2twp)"), true};
     Option<int, IntConstrain> minHoldMs{this, "MinHoldMs",
-        _("Ignore holds shorter than (ms)"), 250, IntConstrain(0, 2000)};);
+        _("Ignore holds shorter than (ms)"), 250, IntConstrain(0, 2000)};
+    // Speak Chinese, get another language: recognition, then the daemon's
+    // translation model (needs the libvoxkit-mt plugin; the model downloads
+    // on first use). Off by default.
+    Option<bool> translateEnabled{this, "TranslateEnabled",
+                                  _("Enable push-to-talk translation"), false};
+    // Right Shift is left alone: 新酷音 Plus uses a double tap of it for
+    // English mode.
+    KeyListOption translateHotkey{this, "TranslateHotkey",
+                                  _("Push-to-translate key (hold)"),
+                                  {Key("Control_R")},
+                                  KeyListConstrain({KeyConstrainFlag::AllowModifierOnly,
+                                                    KeyConstrainFlag::AllowModifierLess})};
+    Option<std::string> translateTarget{this, "TranslateTarget",
+        _("Translate into (en, ja, ko, zh-Hant, fr, de, es, ...)"), "en"};);
 
 class Voxkit final : public AddonInstance {
 public:
@@ -62,12 +76,13 @@ public:
 
 private:
     bool onKey(KeyEvent &event);
-    void begin(InputContext *ic);
+    void begin(InputContext *ic, bool translate);
     void end(InputContext *ic);
     void abandon();
     void onVoiceEvent(const McBopomofo::VoiceEvent &event);
     void deliver(InputContext *ic, const std::string &text);
     bool isHotkey(const Key &raw) const;
+    bool isTranslateHotkey(const Key &raw) const;
     VoxkitRegistration *registrationFor(InputContext *ic);
     bool imBusy(InputContext *ic);
     // Dictation UI lives in the aux area so it never fights the IM preedit.
@@ -88,6 +103,7 @@ private:
     uint64_t serial_ = 0;
     uint64_t req_ = 0;
     bool statusShown_ = false;
+    bool translating_ = false;  // the current round was started by the translate key
     std::chrono::steady_clock::time_point pressedAt_;
     std::chrono::steady_clock::time_point levelAt_;
 };
