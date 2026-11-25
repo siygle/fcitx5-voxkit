@@ -73,6 +73,8 @@ const Key kAltR(FcitxKey_Alt_R);
 const Key kAltRUp(FcitxKey_Alt_R, KeyState::Alt);
 const Key kCtrlR(FcitxKey_Control_R);
 const Key kCtrlRUp(FcitxKey_Control_R, KeyState::Ctrl);
+const Key kSuperR(FcitxKey_Super_R);
+const Key kSuperRUp(FcitxKey_Super_R, KeyState::Super);
 
 size_t count(const std::string &haystack, const std::string &needle) {
     size_t n = 0;
@@ -179,15 +181,68 @@ bool tick(Harness &h) {
                   log.find("\"target\": \"ja\"") != std::string::npos,
               "start carries mode=translate and target=ja");
         h.committed.clear();
-        // Now pretend to be an older daemon: no "translate" capability.
-        std::fclose(std::fopen((std::string(std::getenv("VOXKIT_SOCKET")) + ".nocaps").c_str(), "w"));
-        h.key(kAltR, false);  // a dictation round; the fake hangs up after it
+        // TranslateHotkey is the same KeyListOption as Hotkey: a user can
+        // pick another lone modifier in the addon config.
+        {
+            RawConfig raw;
+            h.voxkit->getConfig()->save(raw);
+            raw.setValueByPath("TranslateHotkey/0", "Super_R");
+            h.voxkit->setConfig(raw);
+        }
+        h.key(kCtrlR, false);
+        check(h.aux().empty(), "Right Ctrl is no longer the translate key");
+        h.key(kCtrlRUp, true);
+        h.key(kSuperR, false);
+        check(h.aux().find("翻譯聆聽") != std::string::npos,
+              "custom Super_R is the translate key, got [" + h.aux() + "]");
         break;
     }
     case 43:
+        h.key(kSuperRUp, true);
+        break;
+    case 47: {
+        check(h.committed == "[ja] Nice weather today",
+              "custom translate key commits a translation, got [" + h.committed +
+                  "]");
+        h.committed.clear();
+        // Same key as dictation: dictation wins, as isHotkey is checked first.
+        {
+            RawConfig raw;
+            h.voxkit->getConfig()->save(raw);
+            raw.setValueByPath("TranslateHotkey/0", "Alt_R");
+            h.voxkit->setConfig(raw);
+        }
+        h.key(kAltR, false);
+        check(h.aux().find("翻譯聆聽") == std::string::npos,
+              "colliding translate key does not start translation, got [" +
+                  h.aux() + "]");
+        check(h.aux().find("聆聽") != std::string::npos,
+              "Alt_R still starts dictation when the keys collide");
+        break;
+    }
+    case 51:
         h.key(kAltRUp, true);
         break;
-    case 47:
+    case 55: {
+        check(h.committed == expected,
+              "collision round is dictation, got [" + h.committed + "]");
+        h.committed.clear();
+        {
+            RawConfig raw;
+            h.voxkit->getConfig()->save(raw);
+            raw.setValueByPath("TranslateHotkey/0", "Control_R");
+            h.voxkit->setConfig(raw);
+        }
+        // Now pretend to be an older daemon: no "translate" capability.
+        std::fclose(std::fopen(
+            (std::string(std::getenv("VOXKIT_SOCKET")) + ".nocaps").c_str(), "w"));
+        h.key(kAltR, false);  // a dictation round; the fake hangs up after it
+        break;
+    }
+    case 59:
+        h.key(kAltRUp, true);
+        break;
+    case 63:
         check(h.committed == expected, "dictation still works");
         h.committed.clear();
         h.key(kCtrlR, false);
@@ -195,9 +250,9 @@ bool tick(Harness &h) {
               "old daemon: translate refused, got [" + h.aux() + "]");
         h.key(kCtrlRUp, true);
         break;
-    case 50:
-        check(count(readFile(std::getenv("FAKE_LOG")), "\"mode\": \"translate\"") == 1,
-              "no translate start sent to the old daemon");
+    case 66:
+        check(count(readFile(std::getenv("FAKE_LOG")), "\"mode\": \"translate\"") == 2,
+              "custom key sent a second translate start; old daemon got none");
         check(h.committed.empty(), "nothing committed for the refused round");
         h.timer->setEnabled(false);
         std::printf(failures ? "VOXKIT TESTS FAILED (%d)\n" : "VOXKIT TESTS OK\n",
