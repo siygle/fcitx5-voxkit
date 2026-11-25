@@ -2,15 +2,22 @@
 //!
 //! The accept loop is non-blocking so a stop flag can end it. Each connection
 //! has one worker thread: that thread owns the microphone (`cpal::Stream` is
-//! not `Send`) and the transcribe-cpp session. The reader thread only parses
-//! lines and can cancel an in-flight run.
+//! not `Send`). The reader thread only parses lines and can cancel an
+//! in-flight run.
+//!
+//! Models are shared by all connections and loaded lazily: the ASR model
+//! (and, for `mode: "translate"`, the translation model) starts loading when
+//! `start` arrives, overlapping the recording, and is unloaded after the idle
+//! timeout (`lifecycle`). A request holds a busy guard from `start` until its
+//! text is delivered or it is cancelled, so its model is never unloaded
+//! under it.
 
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -20,10 +27,13 @@ use serde_json::Value;
 use transcribe_cpp::CancelToken;
 
 use crate::audio::MicCapture;
+use crate::convert::maybe_convert;
 use crate::engine::{Outcome, Transcriber};
+use crate::lifecycle::{self, Busy, Lifecycle};
 use crate::models::{self, Kind};
 use crate::models_ctl;
-use crate::protocol::{self, Command};
+use crate::protocol::{self, Command, Mode};
+use crate::translate::{self, Translator};
 use crate::vad::rms_dbfs;
 
 /// Audio kept after the key is released (the last syllable is often still
@@ -50,14 +60,77 @@ struct Control {
     /// the epoch captured as recording began.
     epoch: AtomicU64,
     token: CancelToken,
+    /// Non-zero asks the translation plugin to stop.
+    mt_cancel: AtomicI32,
+}
+
+/// Models and their use tracking, shared by every connection.
+#[derive(Clone)]
+pub struct Models {
+    pub store: PathBuf,
+    pub asr: Arc<Mutex<Transcriber>>,
+    pub asr_life: Arc<Lifecycle>,
+    pub mt: Arc<Mutex<Translator>>,
+    pub mt_life: Arc<Lifecycle>,
+}
+
+impl Models {
+    pub fn new(store: &Path) -> Self {
+        Models {
+            store: store.to_path_buf(),
+            asr: Arc::new(Mutex::new(Transcriber::new(store.to_path_buf()))),
+            asr_life: Lifecycle::new("speech", lifecycle::asr_idle()),
+            mt: Arc::new(Mutex::new(Translator::new(store.to_path_buf()))),
+            mt_life: Lifecycle::new("translation", lifecycle::mt_idle()),
+        }
+    }
+
+    /// Start loading the ASR model in the background (key down).
+    fn preload_asr(&self, model: &str) {
+        let asr = Arc::clone(&self.asr);
+        let busy = self.asr_life.busy();
+        let model = model.to_string();
+        thread::spawn(move || {
+            let _busy = busy;
+            let mut engine = asr.lock().unwrap_or_else(|e| e.into_inner());
+            if engine.loaded_model() == Some(model.as_str()) {
+                return;
+            }
+            let started = std::time::Instant::now();
+            match engine.preload(&model) {
+                Ok(()) => eprintln!(
+                    "voxkit: preloaded {model} in {} ms",
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => eprintln!("voxkit: preload {model} failed ({err:#})"),
+            }
+        });
+    }
+
+    /// Start loading (or downloading) the translation model (key down).
+    fn preload_mt(&self) {
+        let mt = Arc::clone(&self.mt);
+        let busy = self.mt_life.busy();
+        thread::spawn(move || {
+            let _busy = busy;
+            let mut translator = mt.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(err) = translator.ensure() {
+                eprintln!("voxkit: translation preload: {err}");
+            }
+        });
+    }
 }
 
 struct Active {
     req: u64,
     epoch: u64,
+    mode: Mode,
+    target: String,
     capture: MicCapture,
     level_stop: Arc<AtomicBool>,
     level_thread: Option<JoinHandle<()>>,
+    asr_busy: Option<Busy>,
+    mt_busy: Option<Busy>,
 }
 
 impl Drop for Active {
@@ -76,6 +149,8 @@ enum Job {
         vocabulary: Vec<String>,
         convert: String,
         model: Option<String>,
+        mode: Mode,
+        target: String,
     },
     Stop {
         req: u64,
@@ -95,16 +170,48 @@ pub fn serve(
     default_model: &str,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    // One engine for the daemon: the model is loaded and warmed once at
-    // startup and kept across client reconnects (fcitx5 restarts).
     models_ctl::init_selected(store, default_model);
-    let engine = Arc::new(Mutex::new(Transcriber::new(store.to_path_buf())));
-    {
-        let engine = Arc::clone(&engine);
-        let model = default_model.to_string();
+    let speech = models_ctl::effective_asr(store);
+    let preferred = models_ctl::selected();
+    if models::is_installed(store, &speech) {
+        if speech != preferred && !preferred.is_empty() {
+            eprintln!(
+                "voxkit: speech model {speech} (preferred {preferred} is not installed; `voxkit model install {preferred}` to use it)"
+            );
+        } else {
+            eprintln!("voxkit: speech model {speech}");
+        }
+    } else {
+        eprintln!(
+            "voxkit: no speech model installed (preferred {preferred}); the first dictation starts a download of {}",
+            models::default_asr_id()
+        );
+    }
+    let shared = Models::new(store);
+    eprintln!(
+        "voxkit: models load on first use; idle unload: speech {}, translation {}",
+        describe_idle(shared.asr_life.idle()),
+        describe_idle(shared.mt_life.idle())
+    );
+    match translate::plugin_path() {
+        Some(path) => eprintln!("voxkit: translation plugin available: {}", path.display()),
+        None => eprintln!(
+            "voxkit: translation plugin {} not found; translate requests fall back to the transcript",
+            translate::PLUGIN_FILE
+        ),
+    }
+    // Old behaviour (load and warm at startup) on request.
+    if std::env::var("VOXKIT_PREWARM").is_ok_and(|v| v == "1") {
+        let asr = Arc::clone(&shared.asr);
+        let model = models_ctl::selected();
+        let model = if model.is_empty() {
+            default_model.to_string()
+        } else {
+            model
+        };
         thread::spawn(move || {
             let started = std::time::Instant::now();
-            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            let mut engine = asr.lock().unwrap_or_else(|e| e.into_inner());
             match engine.prewarm(&model) {
                 Ok(()) => eprintln!(
                     "voxkit: {model} ready in {} ms",
@@ -114,6 +221,11 @@ pub fn serve(
             }
         });
     }
+    lifecycle::spawn_reaper(
+        (Arc::clone(&shared.asr_life), Arc::clone(&shared.asr)),
+        (Arc::clone(&shared.mt_life), Arc::clone(&shared.mt)),
+        Arc::clone(&shutdown),
+    );
     if socket.exists() {
         match UnixStream::connect(socket) {
             Ok(_) => anyhow::bail!("voxkit is already listening on {}", socket.display()),
@@ -133,11 +245,10 @@ pub fn serve(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let store = store.to_path_buf();
                 let default_model = default_model.to_string();
-                let engine = Arc::clone(&engine);
+                let shared = shared.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, &store, &default_model, engine) {
+                    if let Err(err) = handle_client(stream, &default_model, shared) {
                         eprintln!("voxkit: client ended: {err:#}");
                     }
                 });
@@ -151,6 +262,13 @@ pub fn serve(
     Ok(())
 }
 
+fn describe_idle(idle: Option<Duration>) -> String {
+    match idle {
+        Some(d) => format!("after {} s", d.as_secs()),
+        None => "never".into(),
+    }
+}
+
 struct SocketFile(PathBuf);
 
 impl Drop for SocketFile {
@@ -159,27 +277,25 @@ impl Drop for SocketFile {
     }
 }
 
-fn handle_client(
-    stream: UnixStream,
-    store: &Path,
-    default_model: &str,
-    engine: Arc<Mutex<Transcriber>>,
-) -> anyhow::Result<()> {
+fn handle_client(stream: UnixStream, default_model: &str, shared: Models) -> anyhow::Result<()> {
     stream.set_nonblocking(false)?;
+    let store = shared.store.clone();
+    let store = store.as_path();
     let writer = Arc::new(Writer {
         inner: Mutex::new(BufWriter::new(stream.try_clone()?)),
     });
     let control = Arc::new(Control {
         epoch: AtomicU64::new(0),
         token: CancelToken::new(),
+        mt_cancel: AtomicI32::new(0),
     });
     let (tx, rx) = mpsc::channel();
     let worker = {
         let writer = Arc::clone(&writer);
         let control = Arc::clone(&control);
-        let store = store.to_path_buf();
         let default_model = default_model.to_string();
-        thread::spawn(move || worker_loop(rx, writer, control, store, default_model, engine))
+        let shared = shared.clone();
+        thread::spawn(move || worker_loop(rx, writer, control, default_model, shared))
     };
 
     let mut reader = BufReader::new(stream);
@@ -205,6 +321,8 @@ fn handle_client(
                 vocabulary,
                 convert,
                 model,
+                mode,
+                target,
             }) => {
                 if tx
                     .send(Job::Start {
@@ -213,6 +331,8 @@ fn handle_client(
                         vocabulary,
                         convert,
                         model,
+                        mode,
+                        target,
                     })
                     .is_err()
                 {
@@ -227,6 +347,7 @@ fn handle_client(
             Ok(Command::Cancel { req }) => {
                 control.epoch.fetch_add(1, Ordering::SeqCst);
                 control.token.cancel();
+                control.mt_cancel.store(1, Ordering::SeqCst);
                 if tx.send(Job::Cancel { req }).is_err() {
                     break;
                 }
@@ -249,14 +370,16 @@ fn handle_client(
                 models_ctl::cancel();
                 writer.send(&models_ctl::progress_value(req));
             }
-            Ok(Command::ModelInstall { req, model }) => match models_ctl::begin(store.to_path_buf(), model) {
-                Ok(()) => {
-                    writer.send(&models_ctl::progress_value(req));
+            Ok(Command::ModelInstall { req, model }) => {
+                match models_ctl::begin(store.to_path_buf(), model) {
+                    Ok(()) => {
+                        writer.send(&models_ctl::progress_value(req));
+                    }
+                    Err((code, message)) => {
+                        writer.send(&protocol::error(req, &code, &message));
+                    }
                 }
-                Err((code, message)) => {
-                    writer.send(&protocol::error(req, &code, &message));
-                }
-            },
+            }
             Ok(Command::ModelRemove { req, model }) => match models_ctl::remove(store, &model) {
                 Ok(()) => {
                     writer.send(&serde_json::json!({
@@ -298,9 +421,8 @@ fn worker_loop(
     rx: Receiver<Job>,
     writer: Arc<Writer>,
     control: Arc<Control>,
-    store: PathBuf,
     default_model: String,
-    engine: Arc<Mutex<Transcriber>>,
+    shared: Models,
 ) {
     let mut vocabulary = Vec::new();
     let mut active: Option<Active> = None;
@@ -315,27 +437,61 @@ fn worker_loop(
                 req,
                 language: lang,
                 vocabulary: terms,
-                convert: mode,
+                convert: conversion,
                 model: requested,
+                mode,
+                target,
             } => {
                 active = None;
                 if !terms.is_empty() {
                     vocabulary = terms;
                 }
                 language = lang;
-                convert = mode;
+                convert = conversion;
                 if let Some(id) = requested {
-                    model = id;
+                    // An explicit id is honoured when present; if it is
+                    // missing, resolve_asr still falls back so a typo in
+                    // selected.txt does not fail a turn that has whisper.
+                    model = models::resolve_asr(&shared.store, &id);
                 } else {
-                    let chosen = models_ctl::selected();
-                    if !chosen.is_empty() {
-                        model = chosen;
-                    }
+                    model = models_ctl::effective_asr(&shared.store);
                 }
-                match begin_capture(&writer, &control, &store, req, &model) {
-                    Ok(session) => active = Some(session),
+                control.mt_cancel.store(0, Ordering::SeqCst);
+                let asr_busy = shared.asr_life.busy();
+                let mt_busy = (mode == Mode::Translate).then(|| shared.mt_life.busy());
+                eprintln!(
+                    "voxkit: req {req} start mode={} target={}",
+                    if mode == Mode::Translate {
+                        "translate"
+                    } else {
+                        "dictate"
+                    },
+                    if mode == Mode::Translate {
+                        target.as_str()
+                    } else {
+                        "-"
+                    }
+                );
+                match begin_capture(&writer, &control, &shared.store, req, &model) {
+                    Ok((epoch, capture, level_stop, level_thread)) => {
+                        shared.preload_asr(&model);
+                        if mode == Mode::Translate {
+                            shared.preload_mt();
+                        }
+                        active = Some(Active {
+                            req,
+                            epoch,
+                            mode,
+                            target,
+                            capture,
+                            level_stop,
+                            level_thread: Some(level_thread),
+                            asr_busy: Some(asr_busy),
+                            mt_busy,
+                        });
+                    }
                     Err((code, message)) => {
-                        writer.send(&protocol::error(req, code, message));
+                        writer.send(&protocol::error(req, code, &message));
                     }
                 }
             }
@@ -352,12 +508,11 @@ fn worker_loop(
                         continue;
                     }
                 };
-                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
                 finish(
                     session,
                     &writer,
                     &control,
-                    &mut engine,
+                    &shared,
                     &vocabulary,
                     &language,
                     &convert,
@@ -373,24 +528,43 @@ fn worker_loop(
     }
 }
 
+type Capture = (u64, MicCapture, Arc<AtomicBool>, JoinHandle<()>);
+
 fn begin_capture(
     writer: &Arc<Writer>,
     control: &Control,
     store: &Path,
     req: u64,
     model: &str,
-) -> Result<Active, (&'static str, &'static str)> {
+) -> Result<Capture, (&'static str, String)> {
     let spec = models::get(model)
         .filter(|spec| spec.kind == Kind::Asr)
-        .ok_or(("bad-model", "unknown model id"))?;
+        .ok_or(("bad-model", "unknown model id".into()))?;
     if models::locate(store, spec).is_none() {
-        return Err(("model-not-ready", "run: voxkit model install"));
+        // Nothing usable: start a download of the small default (not the
+        // preferred 850 MB model) so the next try can work, and tell the
+        // client clearly.
+        let download = models::default_asr_id();
+        if !models_ctl::downloading(download) {
+            match models_ctl::begin(store.to_path_buf(), download.to_string()) {
+                Ok(()) => eprintln!(
+                    "voxkit: no speech model installed; downloading {download} (run `voxkit model install {model}` for that id)"
+                ),
+                Err((code, message)) => {
+                    eprintln!("voxkit: cannot start {download} download: {code} {message}")
+                }
+            }
+        }
+        return Err((
+            "model-not-ready",
+            format!("speech model {model} is not installed; downloading {download}"),
+        ));
     }
     let epoch = control.epoch.fetch_add(1, Ordering::SeqCst) + 1;
     control.token.reset();
     let capture = MicCapture::start().map_err(|err| {
         eprintln!("voxkit: microphone: {err:#}");
-        ("no-input", "no microphone")
+        ("no-input", "no microphone".into())
     })?;
     writer.send(&protocol::ready(req));
     writer.send(&protocol::partial(req, "", "聆聽中"));
@@ -401,13 +575,7 @@ fn begin_capture(
         Arc::clone(writer),
         req,
     );
-    Ok(Active {
-        req,
-        epoch,
-        capture,
-        level_stop,
-        level_thread: Some(level_thread),
-    })
+    Ok((epoch, capture, level_stop, level_thread))
 }
 
 fn spawn_levels(
@@ -433,18 +601,24 @@ fn spawn_levels(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     mut session: Active,
     writer: &Writer,
     control: &Control,
-    engine: &mut Transcriber,
+    shared: &Models,
     vocabulary: &[String],
     language: &str,
     convert: &str,
     model: &str,
 ) {
+    // Keep the models pinned until the text is out.
+    let _asr_busy = session.asr_busy.take();
+    let _mt_busy = session.mt_busy.take();
     let epoch = session.epoch;
     let req = session.req;
+    let mode = session.mode;
+    let target = std::mem::take(&mut session.target);
     let steps = (TAIL.as_millis() / 20) as u32;
     for _ in 0..steps {
         if control.epoch.load(Ordering::SeqCst) != epoch {
@@ -465,19 +639,69 @@ fn finish(
         return;
     }
     writer.send(&protocol::partial(req, "", "辨識中"));
-    let outcome = engine.transcribe(
-        &samples,
-        rate,
-        model,
-        language,
-        vocabulary,
-        convert,
-        &control.token,
-    );
+    // Translation needs the raw transcript; conversion happens afterwards.
+    let asr_convert = if mode == Mode::Translate {
+        "none"
+    } else {
+        convert
+    };
+    let outcome = {
+        let mut engine = shared.asr.lock().unwrap_or_else(|e| e.into_inner());
+        engine.transcribe(
+            &samples,
+            rate,
+            model,
+            language,
+            vocabulary,
+            asr_convert,
+            &control.token,
+        )
+    };
     if control.epoch.load(Ordering::SeqCst) != epoch || control.token.is_cancelled() {
         return;
     }
     match outcome {
+        Ok(Outcome::Text(text)) if mode == Mode::Translate => {
+            writer.send(&protocol::partial(req, "", "翻譯中"));
+            let result = {
+                let mut translator = shared.mt.lock().unwrap_or_else(|e| e.into_inner());
+                translate::run(
+                    &mut translator,
+                    &text,
+                    language,
+                    convert,
+                    &target,
+                    &control.mt_cancel,
+                )
+            };
+            if control.epoch.load(Ordering::SeqCst) != epoch
+                || control.mt_cancel.load(Ordering::SeqCst) != 0
+            {
+                return;
+            }
+            let code = translate::target(&target)
+                .map(|t| t.code)
+                .unwrap_or(target.as_str());
+            let source = maybe_convert(&text, convert);
+            let error = result.error.as_ref().map(|e| e.code());
+            eprintln!(
+                "voxkit: req {req} translate target={code} translated={} error={}",
+                result.translated,
+                result
+                    .error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            writer.send(&protocol::final_translation(
+                req,
+                &result.text,
+                code,
+                result.translated,
+                &source,
+                error,
+            ));
+        }
         Ok(Outcome::Text(text)) => {
             writer.send(&protocol::final_text(req, &text));
         }
@@ -536,6 +760,50 @@ mod tests {
         let value: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(value["type"], "pong");
         assert_eq!(value["req"], 4);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn model_status_advertises_translate() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket = std::env::temp_dir().join(format!("voxkit-caps-{stamp}.sock"));
+        let store = std::env::temp_dir().join(format!("voxkit-caps-store-{stamp}"));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::clone(&shutdown);
+        let socket_for_server = socket.clone();
+        let server =
+            thread::spawn(move || serve(&socket_for_server, &store, "whisper-tiny", shutdown_flag));
+        let mut connected = None;
+        for _ in 0..100 {
+            if let Ok(stream) = UnixStream::connect(&socket) {
+                connected = Some(stream);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut stream = connected.expect("server socket");
+        stream
+            .write_all(b"{\"v\":1,\"type\":\"model.status\",\"req\":8}\n")
+            .unwrap();
+        stream.flush().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        drop(reader);
+        shutdown.store(true, Ordering::SeqCst);
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(value["type"], "model.status");
+        assert_eq!(value["req"], 8);
+        assert!(value["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "translate"));
+        assert_eq!(value["translate"]["model"], "hy-mt1.5-1.8b");
+        assert_eq!(value["translate"]["installed"], false);
         server.join().unwrap().unwrap();
     }
 }

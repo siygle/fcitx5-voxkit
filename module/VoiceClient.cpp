@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -135,7 +136,7 @@ VoiceClient::~VoiceClient() {
 
 void VoiceClient::setCallback(Callback callback) { callback_ = std::move(callback); }
 
-bool VoiceClient::start(uint64_t req, const std::vector<std::string>& vocabulary, bool traditional) {
+bool VoiceClient::ensureConnected() {
   if (fd_ < 0) {
     fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd_ < 0) return false;
@@ -168,12 +169,26 @@ bool VoiceClient::start(uint64_t req, const std::vector<std::string>& vocabulary
     }
     armIo();
   }
+  return fd_ >= 0;
+}
+
+bool VoiceClient::start(uint64_t req, const std::vector<std::string>& vocabulary, bool traditional) {
+  return start(req, vocabulary, traditional, false, std::string());
+}
+
+bool VoiceClient::start(uint64_t req, const std::vector<std::string>& vocabulary, bool traditional,
+                        bool translate, const std::string& target) {
+  if (!ensureConnected()) return false;
   json_object* object = json_object_new_object();
   json_object_object_add(object, "v", json_object_new_int(1));
   json_object_object_add(object, "type", json_object_new_string("start"));
   json_object_object_add(object, "req", json_object_new_int64(static_cast<int64_t>(req)));
   json_object_object_add(object, "language", json_object_new_string("zh"));
   json_object_object_add(object, "convert", json_object_new_string(traditional ? "s2twp" : "none"));
+  if (translate) {
+    json_object_object_add(object, "mode", json_object_new_string("translate"));
+    json_object_object_add(object, "target", json_object_new_string(target.empty() ? "en" : target.c_str()));
+  }
   json_object* words = json_object_new_array();
   for (const auto& term : vocabulary) {
     json_object_array_add(words, json_object_new_string(term.c_str()));
@@ -182,6 +197,66 @@ bool VoiceClient::start(uint64_t req, const std::vector<std::string>& vocabulary
   activeReq_ = req;
   sendJson(object);
   return fd_ >= 0;
+}
+
+bool VoiceClient::supportsTranslate(int timeoutMs) {
+  if (!ensureConnected()) return false;
+  if (caps_ == Caps::Unknown) {
+    caps_ = probeCapabilities(timeoutMs) ? Caps::Translate : Caps::None;
+  }
+  return caps_ == Caps::Translate;
+}
+
+// One synchronous model.status round trip with req 0. Lines that arrive
+// before the answer stay in inbuf_ for onIo(). An old daemon answers with an
+// error (unknown type) or a status without "capabilities": no translate.
+bool VoiceClient::probeCapabilities(int timeoutMs) {
+  json_object* object = json_object_new_object();
+  json_object_object_add(object, "v", json_object_new_int(1));
+  json_object_object_add(object, "type", json_object_new_string("model.status"));
+  json_object_object_add(object, "req", json_object_new_int64(0));
+  sendJson(object);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  size_t scanned = 0;
+  while (fd_ >= 0) {
+    size_t newline;
+    while ((newline = inbuf_.find('\n', scanned)) != std::string::npos) {
+      std::string line = inbuf_.substr(scanned, newline - scanned);
+      json_object* reply = json_tokener_parse(line.c_str());
+      std::string kind = JsonString(reply, "type");
+      bool answer = reply && JsonU64(reply, "req") == 0 &&
+                    (kind == "model.status" || kind == "error");
+      bool translate = false;
+      json_object* caps = nullptr;
+      if (answer && kind == "model.status" &&
+          json_object_object_get_ex(reply, "capabilities", &caps) &&
+          json_object_is_type(caps, json_type_array)) {
+        for (size_t i = 0; i < json_object_array_length(caps); ++i) {
+          const char* cap = json_object_get_string(json_object_array_get_idx(caps, i));
+          if (cap && std::strcmp(cap, "translate") == 0) translate = true;
+        }
+      }
+      if (reply) json_object_put(reply);
+      if (answer) {
+        inbuf_.erase(scanned, newline + 1 - scanned);
+        return translate;
+      }
+      scanned = newline + 1;
+    }
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) return false;
+    pollfd poller{fd_, POLLIN, 0};
+    if (::poll(&poller, 1, static_cast<int>(left)) <= 0) return false;
+    char buf[4096];
+    ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+    if (n <= 0) {
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      return false;
+    }
+    inbuf_.append(buf, static_cast<size_t>(n));
+  }
+  return false;
 }
 
 void VoiceClient::stop(uint64_t req) {
@@ -224,11 +299,18 @@ void VoiceClient::onIo() {
       continue;
     }
     if (n == 0) {
+      // Deliver what arrived before the hang-up (e.g. a final) first.
+      size_t pos = 0;
+      for (size_t nl; (nl = inbuf_.find('\n', pos)) != std::string::npos; pos = nl + 1) {
+        handleLine(inbuf_.substr(pos, nl - pos));
+        if (fd_ < 0) return;
+      }
+      const uint64_t pending = activeReq_;
       closeSocket();
       if (callback_) {
         VoiceEvent event;
         event.kind = VoiceEvent::Kind::Error;
-        event.req = activeReq_;
+        event.req = pending;
         event.code = "disconnected";
         event.message = "語音服務已斷線";
         callback_(event);
@@ -276,6 +358,7 @@ void VoiceClient::closeSocket() {
   inbuf_.clear();
   outbuf_.clear();
   activeReq_ = 0;
+  caps_ = Caps::Unknown;
 }
 
 void VoiceClient::sendJson(json_object* object) {
@@ -309,6 +392,12 @@ void VoiceClient::handleLine(const std::string& line) {
   } else if (kind == "final") {
     event.kind = VoiceEvent::Kind::Final;
     event.text = JsonString(object, "text");
+    event.translateMode = JsonString(object, "mode") == "translate";
+    json_object* flag = nullptr;
+    event.translated = json_object_object_get_ex(object, "translated", &flag) && flag &&
+                       json_object_get_boolean(flag);
+    event.translateError = JsonString(object, "translate_error");
+    event.source = JsonString(object, "source");
     if (activeReq_ == event.req) activeReq_ = 0;
   } else if (kind == "discarded") {
     event.kind = VoiceEvent::Kind::Discarded;

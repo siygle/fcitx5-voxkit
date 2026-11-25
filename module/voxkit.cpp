@@ -26,6 +26,28 @@ bool Sensitive(InputContext *ic) {
     return ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive);
 }
 
+std::string TranslateFallbackText(const std::string &code) {
+    if (code == "model-downloading") {
+        return _("翻譯模型下載中，已輸入原文");
+    }
+    if (code == "plugin-missing") {
+        return _("未安裝翻譯外掛，已輸入原文");
+    }
+    if (code == "bad-target") {
+        return _("不支援的翻譯語言，已輸入原文");
+    }
+    return _("翻譯失敗，已輸入原文");
+}
+
+bool MatchesModifier(const KeyList &keys, const Key &raw) {
+    for (const auto &k : keys) {
+        if (k.isValid() && k.isModifier() && k.sym() == raw.sym()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string ErrorText(const std::string &code) {
     if (code == "model-not-ready") {
         return _("語音模型未安裝");
@@ -102,12 +124,13 @@ bool Voxkit::imBusy(InputContext *ic) {
 }
 
 bool Voxkit::isHotkey(const Key &raw) const {
-    for (const auto &k : *config_.hotkey) {
-        if (k.isValid() && k.isModifier() && k.sym() == raw.sym()) {
-            return true;
-        }
-    }
-    return false;
+    return MatchesModifier(*config_.hotkey, raw);
+}
+
+bool Voxkit::isTranslateHotkey(const Key &raw) const {
+    // The dictation key wins if both are set to the same key.
+    return *config_.translateEnabled && !isHotkey(raw) &&
+           MatchesModifier(*config_.translateHotkey, raw);
 }
 
 bool Voxkit::onKey(KeyEvent &event) {
@@ -115,7 +138,11 @@ bool Voxkit::onKey(KeyEvent &event) {
         return false;
     }
     auto *ic = event.inputContext();
-    const bool hotkey = isHotkey(event.rawKey());
+    const bool translateKey = isTranslateHotkey(event.rawKey());
+    // While a round is running only its own key ends it.
+    const bool hotkey = phase_ == Phase::Listening
+                            ? (translating_ ? translateKey : isHotkey(event.rawKey()))
+                            : (translateKey || isHotkey(event.rawKey()));
     if (!hotkey) {
         // Typing while holding the key cancels: avoids racing the IM.
         if (!event.isRelease() && phase_ == Phase::Listening &&
@@ -137,11 +164,20 @@ bool Voxkit::onKey(KeyEvent &event) {
     if (phase_ != Phase::Idle || Sensitive(ic)) {
         return false;
     }
-    begin(ic);
+    begin(ic, translateKey);
     return phase_ == Phase::Listening;
 }
 
-void Voxkit::begin(InputContext *ic) {
+void Voxkit::begin(InputContext *ic, bool translate) {
+    if (translate && !client_->supportsTranslate()) {
+        // Never send mode=translate to a daemon that does not advertise it:
+        // it would ignore the field and type the Chinese transcript.
+        showStatus(ic, client_->connected()
+                           ? _("語音服務版本太舊，不支援翻譯")
+                           : _("語音服務未啟動（voxkit）"),
+                   true);
+        return;
+    }
     std::vector<std::string> vocabulary;
     if (auto *r = registrationFor(ic); r && r->vocabulary) {
         vocabulary = r->vocabulary();
@@ -149,13 +185,22 @@ void Voxkit::begin(InputContext *ic) {
     req_ = ++serial_;
     ic_ = ic->watch();
     pressedAt_ = std::chrono::steady_clock::now();
-    if (!client_->start(req_, vocabulary, *config_.traditional)) {
+    translating_ = translate;
+    const bool started =
+        translate ? client_->start(req_, vocabulary, *config_.traditional, true,
+                                   *config_.translateTarget)
+                  : client_->start(req_, vocabulary, *config_.traditional);
+    if (!started) {
         req_ = 0;
+        translating_ = false;
         showStatus(ic, _("語音服務未啟動（voxkit）"), true);
         return;
     }
+    VOXKIT_DEBUG() << "start req=" << req_ << " mode="
+                   << (translate ? "translate target=" + *config_.translateTarget
+                                 : std::string("dictate"));
     phase_ = Phase::Listening;
-    showStatus(ic, _("🎙 聆聽中…"));
+    showStatus(ic, translate ? _("🌐 翻譯聆聽中…") : _("🎙 聆聽中…"));
 }
 
 void Voxkit::end(InputContext *ic) {
@@ -166,7 +211,7 @@ void Voxkit::end(InputContext *ic) {
     }
     client_->stop(req_);
     phase_ = Phase::Recognizing;
-    showStatus(ic, _("⋯ 辨識中"));
+    showStatus(ic, translating_ ? _("⋯ 辨識並翻譯中") : _("⋯ 辨識中"));
 }
 
 void Voxkit::abandon() {
@@ -210,7 +255,15 @@ void Voxkit::onVoiceEvent(const McBopomofo::VoiceEvent &e) {
         req_ = 0;
         phase_ = Phase::Idle;
         clearStatus(ic);
+        VOXKIT_DEBUG() << "final req=" << e.req << " translate=" << e.translateMode
+                       << " translated=" << e.translated
+                       << " error=" << e.translateError;
+        // Translated or not, the text goes through the same insert path as
+        // dictation. Nothing user-specific is applied to it here.
         deliver(ic, e.text);
+        if (e.translateMode && !e.translated) {
+            showStatus(ic, TranslateFallbackText(e.translateError), true);
+        }
         break;
     case Kind::Discarded:
         req_ = 0;
@@ -233,7 +286,7 @@ void Voxkit::onVoiceEvent(const McBopomofo::VoiceEvent &e) {
         levelAt_ = now;
         int filled = e.rms > -12 ? 5 : e.rms > -20 ? 4 : e.rms > -28 ? 3
                    : e.rms > -35 ? 2 : e.rms > -45 ? 1 : 0;
-        std::string meter = _("🎙 聆聽中 ");
+        std::string meter = translating_ ? _("🌐 翻譯聆聽中 ") : _("🎙 聆聽中 ");
         for (int i = 0; i < 5; ++i) {
             meter += i < filled ? "●" : "○";
         }

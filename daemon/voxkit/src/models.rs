@@ -18,6 +18,18 @@ use sha2::{Digest, Sha256};
 pub enum Kind {
     Asr,
     Vad,
+    /// Translation model, run by the optional plugin (see `translate`).
+    Mt,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Asr => "asr",
+            Kind::Vad => "vad",
+            Kind::Mt => "mt",
+        }
+    }
 }
 
 pub struct ModelSpec {
@@ -67,6 +79,17 @@ const SPECS: &[ModelSpec] = &[
         license: "MIT (Silero VAD)",
         blurb: "Silero VAD v6.2 F32 GGUF used by transcribe-cpp. Threshold 0.4 and min speech 160 ms, matching Hex.",
     },
+    ModelSpec {
+        id: "hy-mt1.5-1.8b",
+        kind: Kind::Mt,
+        filename: "HY-MT1.5-1.8B-Q4_K_M.gguf",
+        url: "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/265b2e615a7dc9b06c435dc878829ad99a512ba2/HY-MT1.5-1.8B-Q4_K_M.gguf",
+        bytes: 1_133_080_512,
+        sha256: "4383ac0c3c8e476de98ff979c2a3f069f8c4fb385e7860cf2d28da896cc477c7",
+        prompt_chars: 0,
+        license: "Tencent HY Community License (not for use in the EU, UK or South Korea); see the model card",
+        blurb: "HY-MT1.5 1.8B Q4_K_M, the translation model for the translate hotkey. Downloaded on first use; needs the libvoxkit-mt plugin.",
+    },
 ];
 
 pub fn specs() -> &'static [ModelSpec] {
@@ -81,6 +104,46 @@ pub fn default_asr_id() -> &'static str {
     "whisper-tiny"
 }
 
+/// The ASR model that will actually be used: `requested` if that file is
+/// present, otherwise an installed ASR model (preferring `default_asr_id`).
+/// Logs the fallback. If nothing is installed, returns `requested` unchanged
+/// so the caller can report `model-not-ready` or start a download.
+pub fn resolve_asr(store: &Path, requested: &str) -> String {
+    if let Some(spec) = get(requested) {
+        if spec.kind == Kind::Asr && locate(store, spec).is_some() {
+            return requested.to_string();
+        }
+    }
+    let mut fallback: Option<&str> = None;
+    for spec in specs() {
+        if spec.kind != Kind::Asr || locate(store, spec).is_none() {
+            continue;
+        }
+        if spec.id == default_asr_id() {
+            fallback = Some(spec.id);
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(spec.id);
+        }
+    }
+    match fallback {
+        Some(id) => {
+            if id != requested {
+                eprintln!("voxkit: speech model {requested} is not installed; using {id}");
+            }
+            id.to_string()
+        }
+        None => requested.to_string(),
+    }
+}
+
+/// True when a usable copy of this catalog id is in the store (or a
+/// read-only fallback dir).
+pub fn is_installed(store: &Path, id: &str) -> bool {
+    get(id).is_some_and(|spec| locate(store, spec).is_some())
+}
+
 /// Where voxkit itself writes this model (download, delete). Never a
 /// read-only fallback directory.
 pub fn path_for(store: &Path, spec: &ModelSpec) -> PathBuf {
@@ -93,7 +156,11 @@ pub fn path_for(store: &Path, spec: &ModelSpec) -> PathBuf {
 /// the store, so another app's models cannot be changed or removed.
 pub fn readonly_dirs() -> Vec<PathBuf> {
     env::var_os("VOXKIT_READONLY_MODELS_DIRS")
-        .map(|v| env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
+        .map(|v| {
+            env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -121,7 +188,9 @@ pub fn locate(store: &Path, spec: &ModelSpec) -> Option<Location> {
     }
     readonly_dirs().into_iter().find_map(|dir| {
         let candidate = dir.join(spec.filename);
-        let size_ok = fs::metadata(&candidate).map(|m| m.len() == spec.bytes).unwrap_or(false);
+        let size_ok = fs::metadata(&candidate)
+            .map(|m| m.len() == spec.bytes)
+            .unwrap_or(false);
         (candidate.is_file() && size_ok).then_some(Location::Borrowed(candidate))
     })
 }
@@ -172,7 +241,10 @@ pub fn install(store: &Path, id: &str) -> anyhow::Result<PathBuf> {
     }
     if let Some(Location::Borrowed(path)) = locate(store, spec) {
         if file_matches(&path, spec)? {
-            eprintln!("voxkit: {id} already available read-only at {}", path.display());
+            eprintln!(
+                "voxkit: {id} already available read-only at {}",
+                path.display()
+            );
             return Ok(path);
         }
     }
@@ -196,7 +268,7 @@ pub fn install(store: &Path, id: &str) -> anyhow::Result<PathBuf> {
     Ok(dest)
 }
 
-/// Install an ASR model and Silero, or Silero alone.
+/// Install an ASR model and Silero, or Silero / a translation model alone.
 pub fn install_requested(store: &Path, id: Option<&str>) -> anyhow::Result<()> {
     let id = id.unwrap_or_else(|| default_asr_id());
     let spec = get(id).ok_or_else(|| anyhow!("unknown model '{id}'"))?;
@@ -212,7 +284,7 @@ pub fn require_file(store: &Path, id: &str) -> anyhow::Result<PathBuf> {
     let Some(found) = locate(store, spec) else {
         anyhow::bail!("model {id} is not installed. run: voxkit model install {id}");
     };
-    if !file_matches(found.path(), spec)? {
+    if !verified_before(found.path(), spec) && !file_matches(found.path(), spec)? {
         anyhow::bail!(
             "model {id} failed checksum ({}). run: voxkit model install {id}",
             found.path().display()
@@ -227,7 +299,44 @@ fn file_matches(path: &Path, spec: &ModelSpec) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let digest = sha256_file(path)?;
-    Ok(digest.eq_ignore_ascii_case(spec.sha256))
+    let ok = digest.eq_ignore_ascii_case(spec.sha256);
+    if ok {
+        remember_verified(path);
+    }
+    Ok(ok)
+}
+
+/// Files whose checksum already matched in this process, keyed by path and
+/// (size, mtime). Models are now unloaded when idle; reloading must not
+/// hash 850 MB again unless the file changed.
+fn verified(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, std::time::SystemTime)>> {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, std::time::SystemTime)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+fn remember_verified(path: &Path) {
+    if let Some(stamp) = stamp(path) {
+        if let Ok(mut seen) = verified().lock() {
+            seen.insert(path.to_path_buf(), stamp);
+        }
+    }
+}
+
+fn verified_before(path: &Path, spec: &ModelSpec) -> bool {
+    let Some(now) = stamp(path) else { return false };
+    now.0 == spec.bytes
+        && verified()
+            .lock()
+            .map(|seen| seen.get(path) == Some(&now))
+            .unwrap_or(false)
 }
 
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
@@ -325,5 +434,35 @@ mod tests {
             assert!(spec.bytes > 0, "{}", spec.id);
             assert!(spec.url.starts_with("https://"));
         }
+    }
+
+    #[test]
+    fn resolve_asr_falls_back_to_an_installed_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "voxkit-resolve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            resolve_asr(&dir, "qwen3-asr-0.6b"),
+            "qwen3-asr-0.6b",
+            "nothing installed: keep the requested id"
+        );
+        let tiny = path_for(&dir, get("whisper-tiny").unwrap());
+        std::fs::write(&tiny, b"placeholder").unwrap();
+        assert_eq!(
+            resolve_asr(&dir, "qwen3-asr-0.6b"),
+            "whisper-tiny",
+            "configured model missing, an installed ASR is used"
+        );
+        assert_eq!(
+            resolve_asr(&dir, "whisper-tiny"),
+            "whisper-tiny",
+            "the installed requested model is kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

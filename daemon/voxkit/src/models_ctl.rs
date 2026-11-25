@@ -62,9 +62,26 @@ pub fn selected() -> String {
         .unwrap_or_default()
 }
 
+/// The ASR model the daemon will load: the selected/preferred id if that
+/// file is present, otherwise an installed speech model. Does not rewrite
+/// `selected.txt` (the preference stays, for when the user installs it).
+pub fn effective_asr(store: &Path) -> String {
+    let preferred = selected();
+    let requested = if preferred.is_empty() {
+        models::default_asr_id().to_string()
+    } else {
+        preferred
+    };
+    models::resolve_asr(store, &requested)
+}
+
 pub fn select(store: &Path, id: &str) -> Result<(), (String, String)> {
-    if models::get(id).is_none() {
-        return Err(("bad-model".into(), format!("unknown model '{id}'")));
+    match models::get(id) {
+        None => return Err(("bad-model".into(), format!("unknown model '{id}'"))),
+        Some(spec) if spec.kind != Kind::Asr => {
+            return Err(("bad-model".into(), format!("'{id}' is not a speech model")))
+        }
+        Some(_) => {}
     }
     fs::create_dir_all(store).map_err(|err| ("io".into(), err.to_string()))?;
     fs::write(store.join("selected.txt"), format!("{id}\n"))
@@ -84,10 +101,7 @@ pub fn begin(store: PathBuf, id: String) -> Result<(), (String, String)> {
     {
         let guard = job().lock().unwrap_or_else(|err| err.into_inner());
         if guard.state == "downloading" {
-            return Err((
-                "busy".into(),
-                "a download is already running".into(),
-            ));
+            return Err(("busy".into(), "a download is already running".into()));
         }
     }
     cancel_flag().store(false, Ordering::SeqCst);
@@ -104,6 +118,12 @@ pub fn begin(store: PathBuf, id: String) -> Result<(), (String, String)> {
     Ok(())
 }
 
+/// True while `id` is being downloaded.
+pub fn downloading(id: &str) -> bool {
+    let guard = job().lock().unwrap_or_else(|err| err.into_inner());
+    guard.state == "downloading" && guard.model == id
+}
+
 pub fn cancel() {
     cancel_flag().store(true, Ordering::SeqCst);
     let mut guard = job().lock().unwrap_or_else(|err| err.into_inner());
@@ -114,8 +134,8 @@ pub fn cancel() {
 }
 
 pub fn remove(store: &Path, id: &str) -> Result<(), (String, String)> {
-    let spec = models::get(id)
-        .ok_or_else(|| ("bad-model".into(), format!("unknown model '{id}'")))?;
+    let spec =
+        models::get(id).ok_or_else(|| ("bad-model".into(), format!("unknown model '{id}'")))?;
     {
         let guard = job().lock().unwrap_or_else(|err| err.into_inner());
         if guard.state == "downloading" && guard.model == id {
@@ -130,7 +150,10 @@ pub fn remove(store: &Path, id: &str) -> Result<(), (String, String)> {
         if let Some(models::Location::Borrowed(path)) = models::locate(store, spec) {
             return Err((
                 "read-only".into(),
-                format!("{id} is provided read-only by {}; voxkit does not delete it", path.display()),
+                format!(
+                    "{id} is provided read-only by {}; voxkit does not delete it",
+                    path.display()
+                ),
             ));
         }
     }
@@ -150,7 +173,7 @@ fn run_download(store: PathBuf, id: String) {
         fs::create_dir_all(&store).map_err(|err| err.to_string())?;
         if let Some(found) = models::locate(&store, spec) {
             if file_ok(found.path(), spec.bytes, spec.sha256)? {
-                return Ok(());  // already usable (owned or read-only)
+                return Ok(()); // already usable (owned or read-only)
             }
         }
         let dest = models::path_for(&store, spec);
@@ -277,10 +300,7 @@ fn row(store: &Path, spec: &models::ModelSpec, active: &str) -> Value {
     };
     json!({
         "id": spec.id,
-        "kind": match spec.kind {
-            Kind::Asr => "asr",
-            Kind::Vad => "vad",
-        },
+        "kind": spec.kind.as_str(),
         "bytes": spec.bytes,
         "size_on_disk": owned_size,
         "installed": installed,
@@ -307,10 +327,13 @@ pub fn list_value(req: u64, store: &Path) -> Value {
         "store_bytes": directory_bytes(store),
         "model": active,
         "models": models,
+        "capabilities": capabilities(),
     })
 }
 
 pub fn status_value(req: u64, store: &Path) -> Value {
+    // Before taking the job lock: translate_status() reads it too.
+    let translate = translate_status(store);
     let guard = job().lock().unwrap_or_else(|err| err.into_inner());
     json!({
         "v": 1,
@@ -324,6 +347,36 @@ pub fn status_value(req: u64, store: &Path) -> Value {
         "received": guard.received,
         "bytes": guard.bytes,
         "message": guard.message,
+        "capabilities": capabilities(),
+        "translate": translate,
+    })
+}
+
+/// Features this daemon understands. Frontends must see "translate" here
+/// before they send `start` with `mode: "translate"`: an older daemon would
+/// ignore the unknown fields and silently dictate instead.
+pub fn capabilities() -> Value {
+    json!(["translate"])
+}
+
+/// Whether translation can run now (plugin found, model installed). A
+/// missing piece is not fatal: the request falls back to the transcript.
+pub fn translate_status(store: &Path) -> Value {
+    let id = std::env::var("VOXKIT_MT_MODEL")
+        .ok()
+        .filter(|id| models::get(id).is_some_and(|s| s.kind == Kind::Mt))
+        .unwrap_or_else(|| crate::translate::DEFAULT_MT_MODEL.to_string());
+    let installed = models::get(&id)
+        .and_then(|spec| models::locate(store, spec))
+        .is_some();
+    let plugin = crate::translate::plugin_path();
+    json!({
+        "plugin": plugin.is_some(),
+        "plugin_path": plugin.map(|p| p.display().to_string()).unwrap_or_default(),
+        "model": id,
+        "installed": installed,
+        "downloading": downloading(&id),
+        "targets": crate::translate::target_codes(),
     })
 }
 
@@ -366,7 +419,10 @@ mod tests {
             .flatten()
             .map(|e| {
                 let m = e.metadata().unwrap();
-                (e.file_name().to_string_lossy().into_owned(), (m.len(), m.modified().unwrap()))
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    (m.len(), m.modified().unwrap()),
+                )
             })
             .collect()
     }
@@ -382,7 +438,10 @@ mod tests {
         let spec = models::get("silero-vad").unwrap();
         // Same name and size as the real file (content does not matter here).
         let borrowed = hex.join(spec.filename);
-        File::create(&borrowed).unwrap().set_len(spec.bytes).unwrap();
+        File::create(&borrowed)
+            .unwrap()
+            .set_len(spec.bytes)
+            .unwrap();
         std::env::set_var("VOXKIT_READONLY_MODELS_DIRS", &hex);
         let before = snapshot(&hex);
 
