@@ -104,6 +104,46 @@ pub fn default_asr_id() -> &'static str {
     "whisper-tiny"
 }
 
+/// The ASR model that will actually be used: `requested` if that file is
+/// present, otherwise an installed ASR model (preferring `default_asr_id`).
+/// Logs the fallback. If nothing is installed, returns `requested` unchanged
+/// so the caller can report `model-not-ready` or start a download.
+pub fn resolve_asr(store: &Path, requested: &str) -> String {
+    if let Some(spec) = get(requested) {
+        if spec.kind == Kind::Asr && locate(store, spec).is_some() {
+            return requested.to_string();
+        }
+    }
+    let mut fallback: Option<&str> = None;
+    for spec in specs() {
+        if spec.kind != Kind::Asr || locate(store, spec).is_none() {
+            continue;
+        }
+        if spec.id == default_asr_id() {
+            fallback = Some(spec.id);
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(spec.id);
+        }
+    }
+    match fallback {
+        Some(id) => {
+            if id != requested {
+                eprintln!("voxkit: speech model {requested} is not installed; using {id}");
+            }
+            id.to_string()
+        }
+        None => requested.to_string(),
+    }
+}
+
+/// True when a usable copy of this catalog id is in the store (or a
+/// read-only fallback dir).
+pub fn is_installed(store: &Path, id: &str) -> bool {
+    get(id).is_some_and(|spec| locate(store, spec).is_some())
+}
+
 /// Where voxkit itself writes this model (download, delete). Never a
 /// read-only fallback directory.
 pub fn path_for(store: &Path, spec: &ModelSpec) -> PathBuf {
@@ -394,5 +434,35 @@ mod tests {
             assert!(spec.bytes > 0, "{}", spec.id);
             assert!(spec.url.starts_with("https://"));
         }
+    }
+
+    #[test]
+    fn resolve_asr_falls_back_to_an_installed_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "voxkit-resolve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            resolve_asr(&dir, "qwen3-asr-0.6b"),
+            "qwen3-asr-0.6b",
+            "nothing installed: keep the requested id"
+        );
+        let tiny = path_for(&dir, get("whisper-tiny").unwrap());
+        std::fs::write(&tiny, b"placeholder").unwrap();
+        assert_eq!(
+            resolve_asr(&dir, "qwen3-asr-0.6b"),
+            "whisper-tiny",
+            "configured model missing, an installed ASR is used"
+        );
+        assert_eq!(
+            resolve_asr(&dir, "whisper-tiny"),
+            "whisper-tiny",
+            "the installed requested model is kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -81,7 +81,9 @@ cd packaging && makepkg -fd            # Arch package
 | Variable | Default | Meaning |
 |---|---|---|
 | `VOXKIT_MODELS_DIR` | `~/.local/share/hex/models` | Model store (read-only) |
-| `VOXKIT_MODEL` | `qwen3-asr-0.6b` | ASR model id (`voxkit model list`) |
+| `VOXKIT_MODEL` | `qwen3-asr-0.6b` | Preferred ASR model. If that file is missing, the daemon uses an installed one (typically whisper-tiny) and logs the fallback. |
 | `VOXKIT_THREADS` | cores − 2, max 8 | ASR threads |
 | `VOXKIT_PROMPT_CHARS` | 40 | Vocabulary prompt budget; 0 disables |
+| `VOXKIT_IDLE_UNLOAD` | `600` | Unload the ASR model after this many idle seconds (`never` keeps it) |
+| `VOXKIT_MT_IDLE_UNLOAD` | same as above | Idle unload for the translation model |
 | `VOXKIT_TEST_WAV` | — | Replay a WAV instead of the microphone (benchmarks) |

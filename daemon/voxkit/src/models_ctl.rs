@@ -62,6 +62,19 @@ pub fn selected() -> String {
         .unwrap_or_default()
 }
 
+/// The ASR model the daemon will load: the selected/preferred id if that
+/// file is present, otherwise an installed speech model. Does not rewrite
+/// `selected.txt` (the preference stays, for when the user installs it).
+pub fn effective_asr(store: &Path) -> String {
+    let preferred = selected();
+    let requested = if preferred.is_empty() {
+        models::default_asr_id().to_string()
+    } else {
+        preferred
+    };
+    models::resolve_asr(store, &requested)
+}
+
 pub fn select(store: &Path, id: &str) -> Result<(), (String, String)> {
     match models::get(id) {
         None => return Err(("bad-model".into(), format!("unknown model '{id}'"))),

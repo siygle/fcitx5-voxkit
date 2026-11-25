@@ -171,6 +171,22 @@ pub fn serve(
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     models_ctl::init_selected(store, default_model);
+    let speech = models_ctl::effective_asr(store);
+    let preferred = models_ctl::selected();
+    if models::is_installed(store, &speech) {
+        if speech != preferred && !preferred.is_empty() {
+            eprintln!(
+                "voxkit: speech model {speech} (preferred {preferred} is not installed; `voxkit model install {preferred}` to use it)"
+            );
+        } else {
+            eprintln!("voxkit: speech model {speech}");
+        }
+    } else {
+        eprintln!(
+            "voxkit: no speech model installed (preferred {preferred}); the first dictation starts a download of {}",
+            models::default_asr_id()
+        );
+    }
     let shared = Models::new(store);
     eprintln!(
         "voxkit: models load on first use; idle unload: speech {}, translation {}",
@@ -433,12 +449,12 @@ fn worker_loop(
                 language = lang;
                 convert = conversion;
                 if let Some(id) = requested {
-                    model = id;
+                    // An explicit id is honoured when present; if it is
+                    // missing, resolve_asr still falls back so a typo in
+                    // selected.txt does not fail a turn that has whisper.
+                    model = models::resolve_asr(&shared.store, &id);
                 } else {
-                    let chosen = models_ctl::selected();
-                    if !chosen.is_empty() {
-                        model = chosen;
-                    }
+                    model = models_ctl::effective_asr(&shared.store);
                 }
                 control.mt_cancel.store(0, Ordering::SeqCst);
                 let asr_busy = shared.asr_life.busy();
@@ -475,7 +491,7 @@ fn worker_loop(
                         });
                     }
                     Err((code, message)) => {
-                        writer.send(&protocol::error(req, code, message));
+                        writer.send(&protocol::error(req, code, &message));
                     }
                 }
             }
@@ -520,18 +536,35 @@ fn begin_capture(
     store: &Path,
     req: u64,
     model: &str,
-) -> Result<Capture, (&'static str, &'static str)> {
+) -> Result<Capture, (&'static str, String)> {
     let spec = models::get(model)
         .filter(|spec| spec.kind == Kind::Asr)
-        .ok_or(("bad-model", "unknown model id"))?;
+        .ok_or(("bad-model", "unknown model id".into()))?;
     if models::locate(store, spec).is_none() {
-        return Err(("model-not-ready", "run: voxkit model install"));
+        // Nothing usable: start a download of the small default (not the
+        // preferred 850 MB model) so the next try can work, and tell the
+        // client clearly.
+        let download = models::default_asr_id();
+        if !models_ctl::downloading(download) {
+            match models_ctl::begin(store.to_path_buf(), download.to_string()) {
+                Ok(()) => eprintln!(
+                    "voxkit: no speech model installed; downloading {download} (run `voxkit model install {model}` for that id)"
+                ),
+                Err((code, message)) => {
+                    eprintln!("voxkit: cannot start {download} download: {code} {message}")
+                }
+            }
+        }
+        return Err((
+            "model-not-ready",
+            format!("speech model {model} is not installed; downloading {download}"),
+        ));
     }
     let epoch = control.epoch.fetch_add(1, Ordering::SeqCst) + 1;
     control.token.reset();
     let capture = MicCapture::start().map_err(|err| {
         eprintln!("voxkit: microphone: {err:#}");
-        ("no-input", "no microphone")
+        ("no-input", "no microphone".into())
     })?;
     writer.send(&protocol::ready(req));
     writer.send(&protocol::partial(req, "", "聆聽中"));

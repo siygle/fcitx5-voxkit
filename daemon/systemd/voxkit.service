@@ -15,6 +15,9 @@ PartOf=graphical-session.target
 Type=simple
 Environment=VOXKIT_MODELS_DIR=%h/.local/share/voxkit/models
 Environment=VOXKIT_READONLY_MODELS_DIRS=%h/.local/share/hex/models
+# Preferred speech model. If that file is not in the store, the daemon
+# uses any installed ASR model (typically whisper-tiny) and logs the
+# fallback. Install the preferred one with: voxkit model install qwen3-asr-0.6b
 Environment=VOXKIT_MODEL=qwen3-asr-0.6b
 # Tuning (defaults shown): ASR threads = cores-2 capped at 8; prompt budget in
 # characters (each costs ~4 ms of decoding on CPU, 0 disables the prompt).

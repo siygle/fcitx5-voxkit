@@ -24,8 +24,11 @@ key up   ─► stop ───────────────────�
 - **Model.** `hy-mt1.5-1.8b`: `tencent/HY-MT1.5-1.8B-GGUF`, Q4_K_M,
   1 133 080 512 bytes, SHA-256 `4383ac0c…c477c7`, pinned revision `265b2e6`.
   Tencent HY Community License (excludes the EU, UK and South Korea).
-  Not bundled: downloaded on first use (or `voxkit model install
-  hy-mt1.5-1.8b`). `VOXKIT_MT_MODEL` picks another `mt` catalog entry.
+  Not bundled. The IME's first translate request commits the original
+  transcript immediately and starts a background download (status
+  「翻譯模型下載中」). The CLI does the same (prints the original, exit 3)
+  unless you pass `--wait` or run `voxkit model install hy-mt1.5-1.8b`
+  first. `VOXKIT_MT_MODEL` picks another `mt` catalog entry.
 - **Prompt.** The model card's templates: Chinese template when Chinese is on
   either side (`将以下文本翻译为英语，…`), English template otherwise. Greedy
   decoding, top-k 40, repetition penalty 1.05, output ≤ 4×input+64 tokens.
@@ -73,13 +76,36 @@ key up   ─► stop ───────────────────�
 ## Try it without a microphone
 
 ```sh
-voxkit model install hy-mt1.5-1.8b            # or let the first use download it
+voxkit model install hy-mt1.5-1.8b            # skip this to see the fallback
 VOXKIT_MT_PLUGIN=/usr/lib/voxkit/libvoxkit-mt.so \
   voxkit translate --target en 今天天氣很好，我們去公園散步
+# missing model → original text, exit 3 (does not start a download)
+# pass --wait to download first, then translate (exit 0 on success)
 voxkit transcribe clip.wav --model qwen3-asr-0.6b --translate ja
 ```
 
 Exit status 0 = translated, 3 = fell back to the original.
+
+The IME path never blocks on a missing translation model: `start mode=translate`
+commits the ASR transcript at once (`translated:false`,
+`translate_error:model-downloading`) and the frontend shows 「翻譯模型下載中」.
+A later request, once the file is in the store, is translated.
+
+## Speech model default
+
+The systemd unit sets `VOXKIT_MODEL=qwen3-asr-0.6b` as the *preferred* ASR
+model. If that file is not in the store, the daemon uses any installed ASR
+model (typically `whisper-tiny`) and logs the fallback. Install the preferred
+one with `voxkit model install qwen3-asr-0.6b`. If *no* ASR model is
+installed, the first dictation starts a download of the small default
+(`whisper-tiny`), not the 850 MB preferred model.
+
+## Automated daemon checks
+
+`cargo test --manifest-path daemon/Cargo.toml --release --test live_daemon`
+talks to a real `voxkit serve` (needs models and the plugin; skipped when
+they are absent). Defaults look under `/workspace/vkmt-work/`. Override with
+`VOXKIT_ITEST_STORE`, `VOXKIT_MT_PLUGIN`, `VOXKIT_ITEST_WAV`.
 
 ## Build the plugin
 
