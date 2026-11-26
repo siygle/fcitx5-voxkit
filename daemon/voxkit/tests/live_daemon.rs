@@ -261,8 +261,9 @@ fn daemon_translate_commits_original_when_model_is_absent() {
 
     assert_eq!(final_msg["type"], "final", "got {final_msg}");
     assert_eq!(final_msg["translated"], false, "got {final_msg}");
+    // HY-MT is restricted: with no recorded consent nothing is downloaded.
     assert_eq!(
-        final_msg["translate_error"], "model-downloading",
+        final_msg["translate_error"], "license-required",
         "got {final_msg}"
     );
     let text = final_msg["text"].as_str().unwrap_or("");
@@ -271,7 +272,7 @@ fn daemon_translate_commits_original_when_model_is_absent() {
         "fallback should commit the ASR transcript, got {final_msg}"
     );
     assert!(
-        daemon.log().contains("downloading") || daemon.log().contains("not installed"),
+        daemon.log().contains("license") || daemon.log().contains("not installed"),
         "expected a download/missing log, got:\n{}",
         daemon.log()
     );

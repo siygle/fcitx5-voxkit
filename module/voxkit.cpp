@@ -30,6 +30,9 @@ std::string TranslateFallbackText(const std::string &code) {
     if (code == "model-downloading") {
         return _("翻譯模型下載中，已輸入原文");
     }
+    if (code == "license-required") {
+        return _("請先在語音模型同意翻譯模型授權，已輸入原文");
+    }
     if (code == "plugin-missing") {
         return _("未安裝翻譯外掛，已輸入原文");
     }

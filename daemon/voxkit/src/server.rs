@@ -85,6 +85,52 @@ impl Models {
         }
     }
 
+    /// Before `id`'s file is deleted: unload it if it is loaded and idle.
+    /// A request using it (or about to) makes this fail with `in-use`.
+    pub fn release(&self, id: &str) -> Result<(), (String, String)> {
+        use crate::lifecycle::Unload;
+        let Some(spec) = models::get(id) else {
+            return Ok(()); // remove() reports bad-model
+        };
+        let in_use = || {
+            Err((
+                "in-use".to_string(),
+                format!("{id} is in use; try again when the current request is done"),
+            ))
+        };
+        match spec.kind {
+            Kind::Asr | Kind::Vad => {
+                if self.asr_life.inflight() > 0 {
+                    return in_use();
+                }
+                let Ok(mut engine) = self.asr.try_lock() else {
+                    return in_use();
+                };
+                let loaded = match spec.kind {
+                    Kind::Asr => engine.loaded_model() == Some(id),
+                    _ => engine.loaded(),
+                };
+                if loaded {
+                    engine.unload();
+                    eprintln!("voxkit: unloaded {id} before removing it");
+                }
+            }
+            Kind::Mt => {
+                if self.mt_life.inflight() > 0 {
+                    return in_use();
+                }
+                let Ok(mut translator) = self.mt.try_lock() else {
+                    return in_use();
+                };
+                if translator.loaded() && translator.model_id() == id {
+                    translator.unload();
+                    eprintln!("voxkit: unloaded {id} before removing it");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Start loading the ASR model in the background (key down).
     fn preload_asr(&self, model: &str) {
         let asr = Arc::clone(&self.asr);
@@ -370,8 +416,20 @@ fn handle_client(stream: UnixStream, default_model: &str, shared: Models) -> any
                 models_ctl::cancel();
                 writer.send(&models_ctl::progress_value(req));
             }
-            Ok(Command::ModelInstall { req, model }) => {
-                match models_ctl::begin(store.to_path_buf(), model) {
+            Ok(Command::ModelInstall {
+                req,
+                model,
+                accept_license,
+            }) => match models_ctl::begin_with(store.to_path_buf(), model, accept_license) {
+                Ok(()) => {
+                    writer.send(&models_ctl::progress_value(req));
+                }
+                Err((code, message)) => {
+                    writer.send(&protocol::error(req, &code, &message));
+                }
+            },
+            Ok(Command::ModelVerify { req, model }) => {
+                match models_ctl::begin_verify(store.to_path_buf(), model) {
                     Ok(()) => {
                         writer.send(&models_ctl::progress_value(req));
                     }
@@ -380,7 +438,10 @@ fn handle_client(stream: UnixStream, default_model: &str, shared: Models) -> any
                     }
                 }
             }
-            Ok(Command::ModelRemove { req, model }) => match models_ctl::remove(store, &model) {
+            Ok(Command::ModelRemove { req, model }) => match shared
+                .release(&model)
+                .and_then(|()| models_ctl::remove(store, &model))
+            {
                 Ok(()) => {
                     writer.send(&serde_json::json!({
                         "v": 1,
@@ -805,5 +866,35 @@ mod tests {
         assert_eq!(value["translate"]["model"], "hy-mt1.5-1.8b");
         assert_eq!(value["translate"]["installed"], false);
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn remove_refuses_a_model_in_use() {
+        let store = std::env::temp_dir().join(format!("voxkit-release-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&store);
+        fs::create_dir_all(&store).unwrap();
+        let shared = Models::new(&store);
+        {
+            let _busy = shared.asr_life.busy();
+            assert_eq!(shared.release("whisper-tiny").unwrap_err().0, "in-use");
+            assert_eq!(shared.release("silero-vad").unwrap_err().0, "in-use");
+            assert!(
+                shared.release("hy-mt1.5-1.8b").is_ok(),
+                "other slot is free"
+            );
+        }
+        {
+            let _busy = shared.mt_life.busy();
+            assert_eq!(shared.release("hy-mt1.5-1.8b").unwrap_err().0, "in-use");
+        }
+        {
+            let _held = shared.asr.lock().unwrap();
+            assert_eq!(shared.release("qwen3-asr-0.6b").unwrap_err().0, "in-use");
+        }
+        assert!(
+            shared.release("whisper-tiny").is_ok(),
+            "idle: nothing to unload"
+        );
+        let _ = fs::remove_dir_all(&store);
     }
 }

@@ -45,6 +45,12 @@ pub enum Command {
     ModelInstall {
         req: u64,
         model: String,
+        /// The user ticked the license checkbox for a restricted model.
+        accept_license: bool,
+    },
+    ModelVerify {
+        req: u64,
+        model: String,
     },
     ModelProgress {
         req: u64,
@@ -85,6 +91,8 @@ struct Incoming {
     mode: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    accept_license: bool,
 }
 
 pub fn parse_command(line: &str) -> Result<Command, String> {
@@ -125,6 +133,11 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         "ping" => Ok(Command::Ping { req }),
         "model.list" => Ok(Command::ModelList { req }),
         "model.install" => Ok(Command::ModelInstall {
+            req,
+            model: incoming.model.unwrap_or_default(),
+            accept_license: incoming.accept_license,
+        }),
+        "model.verify" => Ok(Command::ModelVerify {
             req,
             model: incoming.model.unwrap_or_default(),
         }),
@@ -299,5 +312,31 @@ mod tests {
         assert!(parse_command("not json").is_err());
         assert!(parse_command(r#"{"v":9,"type":"ping"}"#).is_err());
         assert!(parse_command(r#"{"v":1,"type":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn parses_install_consent_and_verify() {
+        match parse_command(
+            r#"{"v":1,"type":"model.install","req":5,"model":"hy-mt1.5-1.8b","accept_license":true}"#,
+        )
+        .unwrap()
+        {
+            Command::ModelInstall {
+                req,
+                model,
+                accept_license,
+            } => {
+                assert_eq!((req, model.as_str(), accept_license), (5, "hy-mt1.5-1.8b", true));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_command(r#"{"v":1,"type":"model.install","req":6,"model":"x"}"#).unwrap() {
+            Command::ModelInstall { accept_license, .. } => assert!(!accept_license),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_command(r#"{"v":1,"type":"model.verify","req":7,"model":"silero-vad"}"#).unwrap(),
+            Command::ModelVerify { req: 7, .. }
+        ));
     }
 }

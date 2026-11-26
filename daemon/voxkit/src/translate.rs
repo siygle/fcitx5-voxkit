@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::convert::maybe_convert;
-use crate::models::{self, Kind};
+use crate::models;
 use crate::models_ctl;
 
 pub const DEFAULT_MT_MODEL: &str = "hy-mt1.5-1.8b";
@@ -207,6 +207,8 @@ pub enum Failure {
     PluginMissing,
     Plugin(String),
     ModelDownloading,
+    /// The model's license must be accepted before it is downloaded.
+    LicenseRequired,
     Load(String),
     Translate(String),
     Empty,
@@ -220,6 +222,7 @@ impl Failure {
             Failure::PluginMissing => "plugin-missing",
             Failure::Plugin(_) => "plugin-error",
             Failure::ModelDownloading => "model-downloading",
+            Failure::LicenseRequired => "license-required",
             Failure::Load(_) => "load-failed",
             Failure::Translate(_) => "translate-failed",
             Failure::Empty => "empty",
@@ -235,6 +238,12 @@ impl std::fmt::Display for Failure {
             Failure::PluginMissing => write!(f, "translation plugin {PLUGIN_FILE} not found"),
             Failure::Plugin(m) => write!(f, "translation plugin: {m}"),
             Failure::ModelDownloading => write!(f, "translation model is downloading"),
+            Failure::LicenseRequired => {
+                write!(
+                    f,
+                    "accept the translation model's license before it is downloaded"
+                )
+            }
             Failure::Load(m) => write!(f, "translation model failed to load: {m}"),
             Failure::Translate(m) => write!(f, "translation failed: {m}"),
             Failure::Empty => write!(f, "translation was empty"),
@@ -313,6 +322,9 @@ type Loader = dyn FnMut(&Path) -> Result<Box<dyn Engine>, Failure> + Send;
 pub struct Translator {
     store: PathBuf,
     model_id: String,
+    /// Follow `models_ctl::selected_mt()` (the daemon and CLI); tests pin
+    /// one id instead.
+    follow_selection: bool,
     engine: Option<Box<dyn Engine>>,
     loader: Box<Loader>,
 }
@@ -320,17 +332,20 @@ pub struct Translator {
 impl Translator {
     /// Real translator: model from the store, engine from the plugin.
     pub fn new(store: impl Into<PathBuf>) -> Self {
-        let model_id = std::env::var("VOXKIT_MT_MODEL")
-            .ok()
-            .filter(|id| models::get(id).is_some_and(|s| s.kind == Kind::Mt))
-            .unwrap_or_else(|| DEFAULT_MT_MODEL.to_string());
-        Self::with_loader(store, model_id, Box::new(|path| plugin_engine(path)))
+        let mut translator = Self::with_loader(
+            store,
+            models_ctl::selected_mt(),
+            Box::new(|path| plugin_engine(path)),
+        );
+        translator.follow_selection = true;
+        translator
     }
 
     pub fn with_loader(store: impl Into<PathBuf>, model_id: String, loader: Box<Loader>) -> Self {
         Translator {
             store: store.into(),
             model_id,
+            follow_selection: false,
             engine: None,
             loader,
         }
@@ -343,12 +358,24 @@ impl Translator {
     /// Load the model if it is installed. When it is not, start the
     /// download (first use) and report `ModelDownloading`.
     pub fn ensure(&mut self) -> Result<(), Failure> {
+        if self.follow_selection {
+            let wanted = models_ctl::selected_mt();
+            if wanted != self.model_id {
+                self.engine = None;
+                self.model_id = wanted;
+            }
+        }
         if self.engine.is_some() {
             return Ok(());
         }
         let spec = models::get(&self.model_id)
             .ok_or_else(|| Failure::Load(format!("unknown model {}", self.model_id)))?;
         let Some(found) = models::locate(&self.store, spec) else {
+            // A restricted model is never fetched behind the user's back:
+            // first use downloads only after the license was accepted.
+            if !models::license_accepted(&self.store, spec) {
+                return Err(Failure::LicenseRequired);
+            }
             if !models_ctl::downloading(&self.model_id) {
                 match models_ctl::begin(self.store.clone(), self.model_id.clone()) {
                     Ok(()) => eprintln!(
@@ -851,6 +878,22 @@ mod tests {
         let out = run(&mut tr, "原文", "zh", "none", "en", &cancel);
         assert_eq!(out.text, "原文");
         assert_eq!(out.error.unwrap().code(), "plugin-missing");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn restricted_model_is_not_downloaded_without_consent() {
+        let store = std::env::temp_dir().join(format!("voxkit-mt-consent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+        let mut tr = Translator::with_loader(
+            &store,
+            DEFAULT_MT_MODEL.into(),
+            Box::new(|_| Err(Failure::Load("not reached".into()))),
+        );
+        assert_eq!(tr.ensure(), Err(Failure::LicenseRequired));
+        assert!(!models_ctl::downloading(DEFAULT_MT_MODEL));
+        assert_eq!(Failure::LicenseRequired.code(), "license-required");
         let _ = std::fs::remove_dir_all(&store);
     }
 }

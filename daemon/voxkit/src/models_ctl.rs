@@ -4,14 +4,12 @@
 //! version-1 `model.*` commands call, so every frontend shares one download.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 
-use anyhow::anyhow;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -44,14 +42,33 @@ fn cancel_flag() -> &'static AtomicBool {
 }
 
 static SELECTED: OnceLock<Mutex<String>> = OnceLock::new();
+static SELECTED_MT: OnceLock<Mutex<String>> = OnceLock::new();
 
-pub fn init_selected(store: &Path, fallback: &str) {
-    let from_disk = fs::read_to_string(store.join("selected.txt"))
+const SELECTED_FILE: &str = "selected.txt";
+const SELECTED_MT_FILE: &str = "selected-mt.txt";
+
+fn read_selected(store: &Path, file: &str, kind: Kind) -> Option<String> {
+    fs::read_to_string(store.join(file))
         .ok()
         .map(|text| text.trim().to_string())
-        .filter(|id| models::get(id).is_some());
-    let id = from_disk.unwrap_or_else(|| fallback.to_string());
-    let _ = SELECTED.set(Mutex::new(id));
+        .filter(|id| models::get(id).is_some_and(|spec| spec.kind == kind))
+}
+
+pub fn init_selected(store: &Path, fallback: &str) {
+    let id = read_selected(store, SELECTED_FILE, Kind::Asr).unwrap_or_else(|| fallback.to_string());
+    match SELECTED.get() {
+        Some(slot) => *slot.lock().unwrap_or_else(|e| e.into_inner()) = id,
+        None => {
+            let _ = SELECTED.set(Mutex::new(id));
+        }
+    }
+    let mt = read_selected(store, SELECTED_MT_FILE, Kind::Mt).unwrap_or_else(default_mt);
+    match SELECTED_MT.get() {
+        Some(slot) => *slot.lock().unwrap_or_else(|e| e.into_inner()) = mt,
+        None => {
+            let _ = SELECTED_MT.set(Mutex::new(mt));
+        }
+    }
 }
 
 pub fn selected() -> String {
@@ -60,6 +77,24 @@ pub fn selected() -> String {
         .and_then(|slot| slot.lock().ok())
         .map(|guard| guard.clone())
         .unwrap_or_default()
+}
+
+/// `VOXKIT_MT_MODEL` if it names a translation model, else the default.
+fn default_mt() -> String {
+    std::env::var("VOXKIT_MT_MODEL")
+        .ok()
+        .filter(|id| models::get(id).is_some_and(|s| s.kind == Kind::Mt))
+        .unwrap_or_else(|| crate::translate::DEFAULT_MT_MODEL.to_string())
+}
+
+/// The translation model to use: `selected-mt.txt` once the user picked
+/// one, else `VOXKIT_MT_MODEL`, else the default.
+pub fn selected_mt() -> String {
+    SELECTED_MT
+        .get()
+        .and_then(|slot| slot.lock().ok())
+        .map(|guard| guard.clone())
+        .unwrap_or_else(default_mt)
 }
 
 /// The ASR model the daemon will load: the selected/preferred id if that
@@ -75,47 +110,117 @@ pub fn effective_asr(store: &Path) -> String {
     models::resolve_asr(store, &requested)
 }
 
+/// Pick the speech model (`selected.txt`) or the translation model
+/// (`selected-mt.txt`). The VAD has no choice.
 pub fn select(store: &Path, id: &str) -> Result<(), (String, String)> {
-    match models::get(id) {
+    let (file, slot) = match models::get(id) {
         None => return Err(("bad-model".into(), format!("unknown model '{id}'"))),
-        Some(spec) if spec.kind != Kind::Asr => {
-            return Err(("bad-model".into(), format!("'{id}' is not a speech model")))
+        Some(spec) if spec.kind == Kind::Asr => (SELECTED_FILE, &SELECTED),
+        Some(spec) if spec.kind == Kind::Mt => (SELECTED_MT_FILE, &SELECTED_MT),
+        Some(_) => {
+            return Err((
+                "bad-model".into(),
+                format!("'{id}' is not a speech or translation model"),
+            ))
         }
-        Some(_) => {}
-    }
+    };
     fs::create_dir_all(store).map_err(|err| ("io".into(), err.to_string()))?;
-    fs::write(store.join("selected.txt"), format!("{id}\n"))
-        .map_err(|err| ("io".into(), err.to_string()))?;
-    if let Some(slot) = SELECTED.get() {
-        if let Ok(mut guard) = slot.lock() {
-            *guard = id.to_string();
+    fs::write(store.join(file), format!("{id}\n")).map_err(|err| ("io".into(), err.to_string()))?;
+    match slot.get() {
+        Some(slot) => *slot.lock().unwrap_or_else(|e| e.into_inner()) = id.to_string(),
+        None => {
+            let _ = slot.set(Mutex::new(id.to_string()));
         }
     }
     Ok(())
 }
 
+/// Start a download. A restricted model needs `accept_license` (recorded in
+/// the store) or an earlier acceptance; otherwise `license-required`.
 pub fn begin(store: PathBuf, id: String) -> Result<(), (String, String)> {
-    if models::get(&id).is_none() {
+    begin_with(store, id, false)
+}
+
+pub fn begin_with(
+    store: PathBuf,
+    id: String,
+    accept_license: bool,
+) -> Result<(), (String, String)> {
+    let Some(spec) = models::get(&id) else {
         return Err(("bad-model".into(), format!("unknown model '{id}'")));
+    };
+    if accept_license {
+        models::accept_license(&store, &id).map_err(|err| ("io".into(), err.to_string()))?;
+    }
+    if !models::license_accepted(&store, spec) {
+        return Err((
+            "license-required".into(),
+            format!("{id}: accept the license first. {}", spec.restriction),
+        ));
     }
     {
         let guard = job().lock().unwrap_or_else(|err| err.into_inner());
-        if guard.state == "downloading" {
-            return Err(("busy".into(), "a download is already running".into()));
+        if guard.state == "downloading" || guard.state == "verifying" {
+            return Err(("busy".into(), format!("busy with {}", guard.model)));
         }
+    }
+    if models::locate(&store, spec).is_none() {
+        models::ensure_space(&store, spec)?;
     }
     cancel_flag().store(false, Ordering::SeqCst);
     {
-        let spec = models::get(&id).expect("checked");
         let mut guard = job().lock().unwrap_or_else(|err| err.into_inner());
         guard.state = "downloading".into();
         guard.model = id.clone();
-        guard.received = 0;
+        guard.received = spec.bytes - models::remaining_bytes(&store, spec);
         guard.bytes = spec.bytes;
         guard.message.clear();
     }
     thread::spawn(move || run_download(store, id));
     Ok(())
+}
+
+/// Re-hash an installed model in the background (state `verifying`, then
+/// `done` with message `ok` / `corrupt` / `missing`, or `error`).
+pub fn begin_verify(store: PathBuf, id: String) -> Result<(), (String, String)> {
+    let Some(spec) = models::get(&id) else {
+        return Err(("bad-model".into(), format!("unknown model '{id}'")));
+    };
+    {
+        let mut guard = job().lock().unwrap_or_else(|err| err.into_inner());
+        if guard.state == "downloading" || guard.state == "verifying" {
+            return Err(("busy".into(), format!("busy with {}", guard.model)));
+        }
+        guard.state = "verifying".into();
+        guard.model = id.clone();
+        guard.received = 0;
+        guard.bytes = spec.bytes;
+        guard.message.clear();
+    }
+    thread::spawn(move || {
+        let outcome = models::verify(&store, &id);
+        let mut guard = job().lock().unwrap_or_else(|err| err.into_inner());
+        match outcome {
+            Ok(result) => {
+                guard.state = "done".into();
+                guard.received = guard.bytes;
+                guard.message = verify_word(&result).into();
+            }
+            Err(err) => {
+                guard.state = "error".into();
+                guard.message = err.to_string();
+            }
+        }
+    });
+    Ok(())
+}
+
+pub fn verify_word(result: &models::Verified) -> &'static str {
+    match result {
+        models::Verified::Ok(_) => "ok",
+        models::Verified::Missing => "missing",
+        models::Verified::Corrupt(_) => "corrupt",
+    }
 }
 
 /// True while `id` is being downloaded.
@@ -178,11 +283,19 @@ fn run_download(store: PathBuf, id: String) {
         }
         let dest = models::path_for(&store, spec);
         let partial = store.join(format!("{}.partial", spec.filename));
-        download(&spec.url, &partial, spec.bytes)?;
-        if cancel_flag().load(Ordering::SeqCst) {
-            let _ = fs::remove_file(&partial);
-            return Err("cancelled".into());
-        }
+        let bytes = spec.bytes;
+        models::fetch(
+            spec.url,
+            &partial,
+            bytes,
+            &mut |got| {
+                if let Ok(mut guard) = job().lock() {
+                    guard.received = got;
+                    guard.bytes = bytes;
+                }
+            },
+            &|| cancel_flag().load(Ordering::SeqCst),
+        )?;
         if !file_ok(&partial, spec.bytes, spec.sha256)? {
             let _ = fs::remove_file(&partial);
             return Err(format!("checksum mismatch for {id}"));
@@ -198,6 +311,7 @@ fn run_download(store: PathBuf, id: String) {
             guard.message.clear();
         }
         Err(message) if message == "cancelled" || cancel_flag().load(Ordering::SeqCst) => {
+            // The partial file stays; the next install resumes it.
             guard.state = "cancelled".into();
             guard.message = message;
         }
@@ -230,44 +344,6 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn download(url: &str, dest: &Path, expected: u64) -> Result<(), String> {
-    if dest.exists() {
-        let _ = fs::remove_file(dest);
-    }
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(600))
-        .redirects(10)
-        .build();
-    let response = agent
-        .get(url)
-        .set("User-Agent", "voxkit/0.1")
-        .call()
-        .map_err(|err| anyhow!("download {url}: {err}").to_string())?;
-    let mut reader = response.into_reader();
-    let mut file = File::create(dest).map_err(|err| err.to_string())?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut got = 0u64;
-    loop {
-        if cancel_flag().load(Ordering::SeqCst) {
-            drop(file);
-            let _ = fs::remove_file(dest);
-            return Err("cancelled".into());
-        }
-        let n = reader.read(&mut buf).map_err(|err| err.to_string())?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).map_err(|err| err.to_string())?;
-        got += n as u64;
-        if let Ok(mut guard) = job().lock() {
-            guard.received = got;
-            guard.bytes = expected;
-        }
-    }
-    file.flush().map_err(|err| err.to_string())?;
-    Ok(())
-}
-
 fn directory_bytes(store: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(store) else {
         return 0;
@@ -280,7 +356,7 @@ fn directory_bytes(store: &Path) -> u64 {
         .sum()
 }
 
-fn row(store: &Path, spec: &models::ModelSpec, active: &str) -> Value {
+fn row(store: &Path, spec: &models::ModelSpec, active: &str, active_mt: &str) -> Value {
     let found = models::locate(store, spec);
     let size = found
         .as_ref()
@@ -298,34 +374,63 @@ fn row(store: &Path, spec: &models::ModelSpec, active: &str) -> Value {
         Some(models::Location::Owned(_)) => size,
         _ => 0,
     };
+    let partial = spec.bytes - models::remaining_bytes(store, spec);
+    let is_active = match spec.kind {
+        Kind::Asr => spec.id == active,
+        Kind::Mt => spec.id == active_mt,
+        Kind::Vad => false,
+    };
     json!({
         "id": spec.id,
         "kind": spec.kind.as_str(),
+        "purpose": spec.kind.as_str(),
+        "title": spec.title,
         "bytes": spec.bytes,
         "size_on_disk": owned_size,
+        "partial_bytes": if installed { 0 } else { partial },
         "installed": installed,
         "source": source,
         "removable": source == "store",
-        "active": spec.id == active,
+        "active": is_active,
+        "selectable": spec.kind != Kind::Vad,
+        "downloading": downloading(spec.id),
+        "recommended": spec.recommended,
+        "runtime_bytes": spec.runtime_bytes,
+        "license": spec.license,
+        "restricted": spec.restricted,
+        "restriction": spec.restriction,
+        "license_accepted": models::license_accepted(store, spec),
         "blurb": spec.blurb,
     })
 }
 
 pub fn list_value(req: u64, store: &Path) -> Value {
+    list_value_for(req, store, "running")
+}
+
+/// `daemon` is `running` on the socket and `offline` from the CLI.
+pub fn list_value_for(req: u64, store: &Path, daemon: &str) -> Value {
     let active = selected();
+    let active_mt = selected_mt();
     let models: Vec<Value> = models::specs()
         .iter()
-        .map(|spec| row(store, spec, &active))
+        .map(|spec| row(store, spec, &active, &active_mt))
         .collect();
     json!({
         "v": 1,
         "type": "model.list",
         "req": req,
-        "daemon": "running",
+        "daemon": daemon,
         "state": job_state(),
         "store": store.display().to_string(),
         "store_bytes": directory_bytes(store),
+        "free_bytes": models::free_bytes(store).unwrap_or(0),
         "model": active,
+        "model_mt": active_mt,
+        "readonly_dirs": models::readonly_dirs()
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>(),
         "models": models,
         "capabilities": capabilities(),
     })
@@ -343,7 +448,9 @@ pub fn status_value(req: u64, store: &Path) -> Value {
         "state": guard.state,
         "store": store.display().to_string(),
         "store_bytes": directory_bytes(store),
+        "free_bytes": models::free_bytes(store).unwrap_or(0),
         "model": selected(),
+        "model_mt": selected_mt(),
         "received": guard.received,
         "bytes": guard.bytes,
         "message": guard.message,
@@ -356,19 +463,16 @@ pub fn status_value(req: u64, store: &Path) -> Value {
 /// before they send `start` with `mode: "translate"`: an older daemon would
 /// ignore the unknown fields and silently dictate instead.
 pub fn capabilities() -> Value {
-    json!(["translate"])
+    json!(["translate", "model-manager"])
 }
 
 /// Whether translation can run now (plugin found, model installed). A
 /// missing piece is not fatal: the request falls back to the transcript.
 pub fn translate_status(store: &Path) -> Value {
-    let id = std::env::var("VOXKIT_MT_MODEL")
-        .ok()
-        .filter(|id| models::get(id).is_some_and(|s| s.kind == Kind::Mt))
-        .unwrap_or_else(|| crate::translate::DEFAULT_MT_MODEL.to_string());
-    let installed = models::get(&id)
-        .and_then(|spec| models::locate(store, spec))
-        .is_some();
+    let id = selected_mt();
+    let spec = models::get(&id);
+    let installed = spec.and_then(|spec| models::locate(store, spec)).is_some();
+    let accepted = spec.is_some_and(|spec| models::license_accepted(store, spec));
     let plugin = crate::translate::plugin_path();
     json!({
         "plugin": plugin.is_some(),
@@ -376,6 +480,7 @@ pub fn translate_status(store: &Path) -> Value {
         "model": id,
         "installed": installed,
         "downloading": downloading(&id),
+        "license_accepted": accepted,
         "targets": crate::translate::target_codes(),
     })
 }
@@ -488,5 +593,47 @@ mod tests {
         assert_eq!(snapshot(&hex), before, "read-only dir changed");
         std::env::remove_var("VOXKIT_READONLY_MODELS_DIRS");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_rows_carry_manager_fields() {
+        let store = std::env::temp_dir().join(format!("voxkit-rows-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&store);
+        fs::create_dir_all(&store).unwrap();
+        let list = list_value_for(1, &store, "offline");
+        assert_eq!(list["daemon"], "offline");
+        assert!(list["free_bytes"].as_u64().unwrap() > 0);
+        let rows = list["models"].as_array().unwrap();
+        assert_eq!(rows.len(), models::specs().len());
+        let mt = rows.iter().find(|r| r["id"] == "hy-mt1.5-1.8b").unwrap();
+        assert_eq!(mt["purpose"], "mt");
+        assert_eq!(mt["restricted"], true);
+        assert_eq!(mt["license_accepted"], false);
+        assert_eq!(mt["selectable"], true);
+        assert!(mt["runtime_bytes"].as_u64().unwrap() > 0);
+        let vad = rows.iter().find(|r| r["id"] == "silero-vad").unwrap();
+        assert_eq!(vad["selectable"], false);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn restricted_download_needs_consent_and_mt_is_selectable() {
+        let store = std::env::temp_dir().join(format!("voxkit-consent-ctl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&store);
+        fs::create_dir_all(&store).unwrap();
+        let err = begin(store.clone(), "hy-mt1.5-1.8b".into()).unwrap_err();
+        assert_eq!(err.0, "license-required");
+        assert!(!store.join("licenses-accepted.txt").exists());
+
+        select(&store, "hy-mt1.5-1.8b").unwrap();
+        assert_eq!(
+            fs::read_to_string(store.join("selected-mt.txt"))
+                .unwrap()
+                .trim(),
+            "hy-mt1.5-1.8b"
+        );
+        assert_eq!(selected_mt(), "hy-mt1.5-1.8b");
+        assert_eq!(select(&store, "silero-vad").unwrap_err().0, "bad-model");
+        let _ = fs::remove_dir_all(&store);
     }
 }

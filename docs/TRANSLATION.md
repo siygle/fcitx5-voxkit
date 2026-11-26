@@ -24,11 +24,14 @@ key up   ─► stop ───────────────────�
 - **Model.** `hy-mt1.5-1.8b`: `tencent/HY-MT1.5-1.8B-GGUF`, Q4_K_M,
   1 133 080 512 bytes, SHA-256 `4383ac0c…c477c7`, pinned revision `265b2e6`.
   Tencent HY Community License (excludes the EU, UK and South Korea).
-  Not bundled. The IME's first translate request commits the original
-  transcript immediately and starts a background download (status
-  「翻譯模型下載中」). The CLI does the same (prints the original, exit 3)
-  unless you pass `--wait` or run `voxkit model install hy-mt1.5-1.8b`
-  first. `VOXKIT_MT_MODEL` picks another `mt` catalog entry.
+  Not bundled, and **never downloaded without recorded license consent**
+  (`licenses-accepted.txt` in the model store). Consent comes from the model
+  manager's checkbox (`model.install` with `accept_license:true`) or the CLI
+  flag `--accept-license`. Without it a translate request commits the original
+  transcript with `translate_error:license-required` (「請先在語音模型同意授權」).
+  Once accepted, the first translate request commits the original and starts a
+  background download (「翻譯模型下載中」). `model.select` picks the active `mt`
+  model (saved in `selected-mt.txt`); `VOXKIT_MT_MODEL` sets the default.
 - **Prompt.** The model card's templates: Chinese template when Chinese is on
   either side (`将以下文本翻译为英语，…`), English template otherwise. Greedy
   decoding, top-k 40, repetition penalty 1.05, output ≤ 4×input+64 tokens.
@@ -37,7 +40,7 @@ key up   ─► stop ───────────────────�
 - **Failure = original text.** No plugin, model still downloading, load or
   decode error, empty output, unknown target: the final carries the original
   transcript (converted as in dictation), `translated:false` and
-  `translate_error` (`plugin-missing`, `model-downloading`, `load-failed`,
+  `translate_error` (`plugin-missing`, `license-required`, `model-downloading`, `load-failed`,
   `translate-failed`, `empty`, `bad-target`).
 - **User dictionary.** Still sent as the ASR vocabulary prompt (it helps
   recognize names). It is never applied to the translation.
@@ -76,11 +79,11 @@ key up   ─► stop ───────────────────�
 ## Try it without a microphone
 
 ```sh
-voxkit model install hy-mt1.5-1.8b            # skip this to see the fallback
+voxkit model install hy-mt1.5-1.8b --accept-license   # skip this to see the fallback
 VOXKIT_MT_PLUGIN=/usr/lib/voxkit/libvoxkit-mt.so \
   voxkit translate --target en 今天天氣很好，我們去公園散步
 # missing model → original text, exit 3 (does not start a download)
-# pass --wait to download first, then translate (exit 0 on success)
+# pass --wait --accept-license to download first, then translate (exit 0 on success)
 voxkit transcribe clip.wav --model qwen3-asr-0.6b --translate ja
 ```
 
@@ -155,3 +158,28 @@ have got from dictation):
 Peak RSS with both models loaded is about 2.0 GB (the GGUF is mmapped, so
 most of it is page cache); after the idle unload the daemon is back to
 about 60 MB.
+
+## Model manager (protocol and offline CLI)
+
+Capability `"model-manager"` (in `capabilities`) means the daemon speaks the
+fields below. Frontends draw their model window from `model.list` alone.
+
+- `model.list` rows: `id title purpose(asr|mt|vad) kind bytes size_on_disk
+  partial_bytes runtime_bytes installed active selectable downloading
+  recommended removable source license restricted restriction
+  license_accepted blurb`. Top level adds `free_bytes`, `model`, `model_mt`,
+  `readonly_dirs`, `daemon`.
+- `model.install {model, accept_license?}`: restricted models answer
+  `error license-required` until consent is given (it is recorded once).
+  Errors also include `no-space` (free space under size − partial + 64 MiB)
+  and `busy`. Downloads resume from `<file>.partial` (HTTP Range); cancel
+  keeps the partial file.
+- `model.verify {model}`: background re-hash; `model.progress` shows
+  `state:"verifying"` then `done` with `message` `ok|missing|corrupt`.
+- `model.remove {model}`: if the model is loaded and idle it is unloaded
+  first; while a request uses it the answer is `error in-use`.
+- `model.select {model}`: ASR or MT; VAD is `bad-model`.
+
+Without a running daemon, `voxkit model list|install|remove|verify|select
+<id> --json` prints the same JSON lines (with `daemon:"offline"`); `remove`
+refuses with `daemon-running` if the socket answers.
